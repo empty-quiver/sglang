@@ -24,10 +24,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
-from sglang.srt.speculative.dflash_utils import (
-    resolve_dflash_auto_memory_plan,
-    resolve_dflash_max_mamba_cache_size,
-)
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -194,17 +190,6 @@ class ModelRunnerKVCacheMixin:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
-            )
-        elif (
-            self.spec_algorithm.is_dflash()
-            and server_args.max_running_requests is not None
-        ):
-            # DFLASH hybrid runs should reserve resident mamba cache directly
-            # from the requested concurrency so the later request clamp becomes
-            # a safety backstop instead of the normal path.
-            server_args.max_mamba_cache_size = resolve_dflash_max_mamba_cache_size(
-                max_running_requests=server_args.max_running_requests // self.dp_size,
-                mamba_ratio=self._calculate_mamba_ratio(),
             )
         elif (
             server_args.disable_radix_cache
