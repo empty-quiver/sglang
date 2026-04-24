@@ -262,6 +262,17 @@ class SharedFullContext:
 
         # INT4 Marlin
         if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
+            self.is_fp4_quant = False
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
+
+        # FP4 (check BEFORE FP8 since both have weight_scale_inv)
+        # Distinguishing: FP4 weights are INT8 (nibble-packed), FP8 are float8_e4m3fn
+        if (hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv")
+                and hasattr(layer, "w13_weight") and layer.w13_weight.dtype == torch.int8):
+            self.is_fp4_quant = True
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -269,6 +280,7 @@ class SharedFullContext:
 
         # FP8 block
         if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
+            self.is_fp4_quant = False
             self.is_fp8_quant = True
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -276,6 +288,7 @@ class SharedFullContext:
 
         # FP8 per-channel
         if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
+            self.is_fp4_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = True
             self.is_bf16_quant = False
@@ -283,12 +296,14 @@ class SharedFullContext:
 
         # BF16 / unquantized
         if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
+            self.is_fp4_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = True
             return
 
         # Fallback to class-based detection for unknown layouts.
+        self.is_fp4_quant = False
         self.is_fp8_quant = self._detect_fp8_quant()
         self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
         self.is_bf16_quant = self._detect_bf16_quant()
@@ -401,7 +416,9 @@ class SharedFullContext:
     @property
     def weight_names(self) -> list:
         """Get weight names based on quantization type."""
-        if self.is_fp8_quant:
+        if self.is_fp4_quant:
+            return self.WEIGHT_NAMES_FP4
+        elif self.is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
         elif self.is_fp8_channel_quant:
             return self.WEIGHT_NAMES_FP8_CHANNEL
@@ -409,6 +426,14 @@ class SharedFullContext:
             return self.WEIGHT_NAMES_BF16
         else:
             return self.WEIGHT_NAMES_INT4
+
+    # Weight names for FP4 format (INT8-packed FP4 weights, same naming as FP8 block)
+    WEIGHT_NAMES_FP4 = [
+        "w13_weight",
+        "w13_weight_scale_inv",
+        "w2_weight",
+        "w2_weight_scale_inv",
+    ]
 
     # Weight names for shared memory buffers (INT4 Marlin format)
     WEIGHT_NAMES_INT4 = [
@@ -1245,7 +1270,17 @@ class SharedFullContext:
 
         # Select appropriate prepare_weight method based on quantization type
         # FP8/BF16 methods support GPU expert optimization; INT4 uses full CPU pipeline
-        if self.is_fp8_quant:
+        # FP4 layerwise prefill not yet implemented — weights are loaded directly
+        # by the CPU backend from safetensors.
+        if self.is_fp4_quant:
+            if tp_rank == 0:
+                logger.info(
+                    "KT layerwise prefill: layer %d FP4 weights — skipping "
+                    "(loaded directly by CPU backend from safetensors)",
+                    layer_idx,
+                )
+            return
+        elif self.is_fp8_quant:
             self._prepare_weight_fp8(wrapper, original_layer, gpu_experts_mask,
                                      logical_to_gpu_index)
         elif self.is_fp8_channel_quant:
@@ -2315,9 +2350,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
 
         # Check for full GPU fallback
+        # FP4 layerwise prefill not yet implemented — skip full GPU fallback
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
+            and self.kt_config.method != "MXFP4"
         ):
             ctx = self._build_full_context(layer)
 
@@ -2446,7 +2483,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             dist.broadcast(selected_experts, src=0, group=get_tp_group().device_group)
 
         # Step 2: Copy weights from temporary layer to original layer
-        if ctx.is_fp8_quant:
+        # FP4 layerwise prefill not yet implemented
+        if ctx.is_fp4_quant:
+            return
+        elif ctx.is_fp8_quant:
             copy_experts_weights_fp8(
                 src_layer=ctx.gpu_layer,
                 dst_layer=layer,

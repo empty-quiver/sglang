@@ -1105,6 +1105,9 @@ class DeepseekV2MoE(nn.Module):
         if self.is_nextn:
             return False
 
+        if isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            return False
+
         if not envs.SGLANG_OPT_FIX_HASH_MEGA_MOE.get():
             if self.is_hash:
                 return False
