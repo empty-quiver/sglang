@@ -414,6 +414,20 @@ class SchedulerOutputProcessorMixin:
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
+            prepared_kv_lens_cpu = getattr(
+                result, "prepared_kv_allocated_lens_cpu", None
+            )
+            if prepared_kv_lens_cpu is not None:
+                for i, req in enumerate(batch.reqs):
+                    if self.enable_overlap and (req.finished() or req.is_retracted):
+                        continue
+                    # In overlap mode, a newer batch may already have reserved
+                    # further KV slots before this older result is processed.
+                    # Do not move the request-side allocation watermark
+                    # backwards or release_kv_cache can miss those pages.
+                    req.kv_allocated_len = max(
+                        req.kv_allocated_len, int(prepared_kv_lens_cpu[i])
+                    )
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
         self.num_generated_tokens += len(batch.reqs)
