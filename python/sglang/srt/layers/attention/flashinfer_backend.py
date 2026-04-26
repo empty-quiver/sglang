@@ -24,7 +24,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
@@ -1416,14 +1416,26 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = None
         else:
             assert isinstance(spec_info, SpecInput)
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        req_pool_indices,
+                        paged_kernel_lens,
+                        paged_kernel_lens_sum,
+                        self.req_to_token,
+                        kv_start_idx=kv_start_idx,
+                    )
                 )
-            )
+            else:
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        req_pool_indices,
+                        paged_kernel_lens,
+                        paged_kernel_lens_sum,
+                        self.req_to_token,
+                    )
+                )
+            bs_eff = bs
 
         # extend part
         if use_ragged:
