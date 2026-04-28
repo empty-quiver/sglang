@@ -145,6 +145,12 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
+                # Qwen3.5/3.6 hybrid MoE arch is wrapped as a
+                # ForConditionalGeneration class but in our serving setup
+                # we never use the vision tower; treating as text-only
+                # avoids needing a registered MM processor for it.
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
