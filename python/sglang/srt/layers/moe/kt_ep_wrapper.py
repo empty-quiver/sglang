@@ -82,6 +82,7 @@ class KTConfig:
     method: str
     numa_nodes: Optional[List[int]] = None
     num_layers: Optional[int] = None
+    pp_end_layer: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
 
@@ -1589,7 +1590,12 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         raise ValueError(f"Unknown kt_expert_placement_strategy: {strategy}")
 
     if dist.is_initialized():
-        dist.broadcast(masks, src=0, group=get_tp_group().cpu_group)
+        _group = get_tp_group().cpu_group
+        # PP-aware: translate group-local rank 0 to its global rank so the
+        # broadcast source is in the group (under PP, rank 1's TP group does
+        # not contain global rank 0).
+        _src = dist.get_global_rank(_group, 0)
+        dist.broadcast(masks, src=_src, group=_group)
 
     _KT_GPU_EXPERTS_MASKS = masks
 
@@ -1663,6 +1669,23 @@ def create_kt_config_from_server_args(
         hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
 
+    # If PP is active, compute this rank's local end_layer so KTEPWrapperMethod
+    # can correctly disable deferred experts on the last *local* MoE layer.
+    pp_end_layer = None
+    if num_layers is not None:
+        try:
+            from sglang.srt.distributed import get_pp_group, get_pp_indices
+
+            pp_group = get_pp_group()
+            if pp_group.world_size > 1:
+                _, pp_end_layer = get_pp_indices(
+                    num_layers,
+                    pp_group.rank_in_group,
+                    pp_group.world_size,
+                )
+        except Exception:
+            pp_end_layer = None
+
     return KTConfig(
         layer_idx=layer_idx,
         gpu_experts_mask=gpu_experts_mask,
@@ -1674,6 +1697,7 @@ def create_kt_config_from_server_args(
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
+        pp_end_layer=pp_end_layer,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
     )
@@ -1996,6 +2020,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
+        # KT CPU offload only runs on the PP rank that owns the back-half
+        # layers (where the bulk of MoE blocks live and where lm_head is).
+        # On other PP ranks we skip every KT-side allocation/submit/sync.
+        from sglang.srt.distributed import get_pp_group
+        self.pp_group = get_pp_group()
+        self._is_kt_active_rank = (
+            self.tp_rank == 0 and self.pp_group.is_last_rank
+        )
 
         # Mapping tables for non-contiguous GPU expert allocation (CPU tensors)
         # Used by weight_loader to remap expert_id when loading weights
@@ -2061,10 +2093,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
 
         layer_max_deferred = self.kt_config.max_deferred_experts_per_token or 0
+        # Prefer the PP-local end_layer when available so the last *local*
+        # MoE layer disables deferred experts; otherwise fall back to the
+        # global num_layers boundary (single-PP behavior).
+        last_local_layer = (
+            (self.kt_config.pp_end_layer - 1)
+            if self.kt_config.pp_end_layer is not None
+            else (
+                self.kt_config.num_layers - 1
+                if self.kt_config.num_layers is not None
+                else None
+            )
+        )
         if (
             self.kt_config.max_deferred_experts_per_token is not None
-            and self.kt_config.num_layers is not None
-            and self.kt_config.layer_idx == self.kt_config.num_layers - 1
+            and last_local_layer is not None
+            and self.kt_config.layer_idx == last_local_layer
         ):
             layer_max_deferred = 0
 
@@ -2085,8 +2129,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
 
-        # Initialize dual-stream for CPU-GPU parallelism (rank 0 only)
-        if self.tp_rank == 0:
+        # Initialize dual-stream for CPU-GPU parallelism (active rank only)
+        if self._is_kt_active_rank:
             self._cpu_stream = torch.cuda.Stream(device=target_device)
             self._sync_done_event = torch.cuda.Event()
 
@@ -2100,7 +2144,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
-        if self.tp_rank == 0:
+        if self._is_kt_active_rank:
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -2128,7 +2172,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
-        if self.tp_rank == 0 and self.wrapper is not None:
+        if self._is_kt_active_rank and self.wrapper is not None:
             torch.cuda.synchronize()
 
             # Get expert location metadata for CPU expert mapping
@@ -2197,7 +2241,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
-        if self.tp_rank != 0 or self.wrapper is None:
+        if not self._is_kt_active_rank or self.wrapper is None:
             return
 
         x = dispatch_output.hidden_states
@@ -2220,7 +2264,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             CPU expert computation results
         """
-        if self.tp_rank != 0 or self.wrapper is None:
+        if not self._is_kt_active_rank or self.wrapper is None:
             return torch.zeros_like(x)
 
         # Wait for CPU computation and retrieve results
@@ -2245,7 +2289,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
-        if self.tp_rank != 0 or self.wrapper is None:
+        if not self._is_kt_active_rank or self.wrapper is None:
             return
 
         topk_output = dispatch_output.topk_output
@@ -2270,7 +2314,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             CPU expert computation results
         """
-        if self.tp_rank != 0 or self.wrapper is None:
+        if not self._is_kt_active_rank or self.wrapper is None:
             return torch.zeros_like(staged_hidden_states)
 
         return self.wrapper.sync_forward(
@@ -2302,9 +2346,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        # Record GPU expert mask for distribution tracking (rank 0 only)
+        # Record GPU expert mask for distribution tracking (active rank only)
         # Use gpu_experts_mask_cuda which is already on GPU for CUDA graph compatibility
-        if self.tp_rank == 0:
+        if self._is_kt_active_rank:
             recorder = get_global_expert_distribution_recorder()
             recorder.on_gpu_expert_mask(
                 self.kt_config.layer_idx, self.gpu_experts_mask_cuda
@@ -2339,7 +2383,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     torch.cuda.synchronize()
                 update_time = (time.perf_counter() - t_update) * 1000.0
 
-                if self.tp_rank == 0:
+                if self._is_kt_active_rank:
                     logger.info(
                         "KT layerwise prefill: layer %d compute = %.2f ms, expert update = %.2f ms",
                         self.kt_config.layer_idx,
@@ -2347,7 +2391,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         update_time,
                     )
             else:
-                if self.tp_rank == 0:
+                if self._is_kt_active_rank:
                     logger.info(
                         "KT layerwise prefill: layer %d compute = %.2f ms",
                         self.kt_config.layer_idx,
@@ -2359,7 +2403,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
-        if self.tp_rank == 0 and self._cpu_stream is not None:
+        if self._is_kt_active_rank and self._cpu_stream is not None:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
@@ -2394,7 +2438,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         output = gpu_combine_input.hidden_states
-        if self.tp_rank == 0 and self._cpu_stream is not None:
+        if self._is_kt_active_rank and self._cpu_stream is not None:
             with torch.cuda.stream(self._cpu_stream):
                 # Use staging_buffer for sync to get correct buffer reference
                 cpu_output = self._sync_with_staged_input(staging_buffer)
@@ -2429,7 +2473,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_ids = dispatch_output.topk_output.topk_ids
         device = topk_ids.device
 
-        if self.tp_rank == 0:
+        if self._is_kt_active_rank:
             selected_experts = select_top_experts_from_batch(
                 topk_ids=topk_ids,
                 num_experts=self.global_num_experts,
@@ -2490,12 +2534,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.logical_to_gpu_index_cuda.copy_(logical_to_gpu_index_cuda)  # In-place update for CUDA graph
         self.gpu_index_to_logical = gpu_index_to_logical_cpu  # CPU tensor, safe to replace
 
-        # Step 4: Update KT wrapper (rank 0 only)
-        if self.tp_rank == 0:
+        # Step 4: Update KT wrapper (active rank only)
+        if self._is_kt_active_rank:
             update_kt_wrapper_masks(self.wrapper, gpu_experts_mask_cpu)
 
-        # Log expert changes (rank 0 only)
-        if self.tp_rank == 0:
+        # Log expert changes (active rank only)
+        if self._is_kt_active_rank:
             logger.debug(
                 "KT dynamic update: layer %d updated GPU experts to: %s",
                 self.kt_config.layer_idx,
