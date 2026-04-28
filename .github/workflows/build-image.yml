@@ -1,0 +1,100 @@
+name: Build lambda-vector-pp image
+
+# Builds the sglang-kt + kt-kernel container image for the lambda-vector-pp
+# branch and pushes it to GitHub Container Registry. See LAMBDA-VECTOR-PP.md
+# for the full migration story.
+#
+# Triggers:
+#   - push to lambda-vector-pp (every commit gets a fresh image, ghcr cached)
+#   - manual dispatch (for branch experiments / re-runs)
+#
+# Targets sm_86 + sm_89 only — saves ~80% of build time vs the upstream
+# multi-arch matrix because we have no Hopper / Blackwell hardware.
+
+on:
+  push:
+    branches:
+      - lambda-vector-pp
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Free up disk space
+        # Stripped-down version of jlumbroso/free-disk-space - the
+        # sgl-kernel build can consume 50+ GB of disk under /tmp during nvcc.
+        # GitHub-hosted runners only have ~14 GB free by default; clearing
+        # the swap, the dotnet stack, and android SDKs gives us 25-30 GB.
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          # Lowercase for ghcr (registry is case-insensitive but pull URLs
+          # mismatch if the casing changes between push and pull).
+          REPO_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${REPO_LC}/sglang-kt"
+          SHORT_SHA="$(echo '${{ github.sha }}' | cut -c1-12)"
+          {
+            echo "image=${IMAGE}"
+            echo "sha_tag=${IMAGE}:sha-${SHORT_SHA}"
+            echo "branch_tag=${IMAGE}:lambda-vector-pp"
+          } >> "$GITHUB_OUTPUT"
+          echo "Image tags:"
+          echo "  ${IMAGE}:sha-${SHORT_SHA}"
+          echo "  ${IMAGE}:lambda-vector-pp"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/lambda-vector-pp.Dockerfile
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.sha_tag }}
+            ${{ steps.tags.outputs.branch_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # The Dockerfile already pins TORCH_CUDA_ARCH_LIST="8.6;8.9", so
+          # we don't need a build-arg for it.
+          provenance: false
+          sbom: false
+
+      - name: Print pull command
+        run: |
+          echo "Built image:"
+          echo "  ${{ steps.tags.outputs.sha_tag }}"
+          echo "  ${{ steps.tags.outputs.branch_tag }}"
+          echo
+          echo "Pull with:"
+          echo "  docker pull ${{ steps.tags.outputs.branch_tag }}"

@@ -1,0 +1,52 @@
+From: empty-quiver
+Date: Fri, 25 Apr 2026
+Subject: [PATCH] kt-kernel: handle non-NUMA / single-socket machines in set_to_numa
+
+The original set_to_numa() unconditionally calls numa_bitmask_setbit(mask,
+this_numa), which segfaults on single-socket machines (NUMA reports 0 or
+1 nodes, this_numa often >= node count). Affects any non-server CPU
+without explicit NUMA topology — including Ryzen 9 7950X (Zen 4,
+single socket).
+
+Patch from kvcache-ai/ktransformers#1754 comment by iteratorlee
+(2025-12-27). Maintainer acknowledged but never merged the actual diff;
+applying it locally for our build.
+
+---
+ kt-kernel/cpu_backend/worker_pool.h | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/kt-kernel/cpu_backend/worker_pool.h b/kt-kernel/cpu_backend/worker_pool.h
+index 0000000..0000000 100644
+--- a/kt-kernel/cpu_backend/worker_pool.h
++++ b/kt-kernel/cpu_backend/worker_pool.h
+@@ -28,9 +28,15 @@
+ // #define PROFILE_BALANCE
+
+ inline void set_to_numa(int this_numa) {
++  int numa_nodes = numa_num_configured_nodes();
++  if (numa_nodes <= 0) {
++    // No NUMA nodes available, skip NUMA binding
++    return;
++  }
++
+   struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
+-  numa_bitmask_setbit(mask, this_numa);
+-  numa_bind(mask);
++  numa_bitmask_setbit(mask, this_numa % numa_nodes);  // Ensure within bounds
++  numa_bind(mask);
+   numa_bitmask_free(mask);
+ }
+
+@@ -38,6 +44,11 @@ inline void set_memory_to_numa(int this_numa) {
+   // printf("Set memory to NUMA %d\n", this_numa);
+   hwloc_topology_t topology;
+   hwloc_topology_init(&topology);
++
++  int numa_nodes = numa_num_configured_nodes();
++  if (numa_nodes <= 0 || this_numa >= numa_nodes) {
++    return;  // No NUMA support or invalid node
++  }
+   hwloc_topology_load(topology);
+
+   hwloc_obj_t obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, this_numa);
