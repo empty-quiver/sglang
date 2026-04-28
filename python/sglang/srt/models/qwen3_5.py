@@ -748,8 +748,28 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
+        # Only stamp the capture flag on PP-local layers. PPMissingLayer
+        # placeholders at out-of-range indices are torch.nn.Identity and
+        # never get invoked, but stamping them is also harmless. We restrict
+        # the stamp to local layers anyway so the post-init log is precise
+        # and so any future shared-instance gotchas are avoided.
         for layer_id in self.layers_to_capture:
-            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+            if self.start_layer <= layer_id < self.end_layer:
+                setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        local_capture_ids = [
+            lid
+            for lid in self.layers_to_capture
+            if self.start_layer <= lid < self.end_layer
+        ]
+        logger.info(
+            "DFLASH set_dflash_layers_to_capture: pp_rank=%d slice=[%d,%d) "
+            "all_ids=%s local_ids=%s",
+            self.pp_group.rank_in_group,
+            self.start_layer,
+            self.end_layer,
+            self.layers_to_capture,
+            local_capture_ids,
+        )
 
     @torch.no_grad()
     def forward(
@@ -830,6 +850,21 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        # First-iter visibility for the DFLASH PP aux flow. Logs how many
+        # aux tensors this rank is about to hand back to the LogitsProcessor
+        # call site (5 expected for Lorbus 27B + z-lab DFlash drafter).
+        if not getattr(self, "_dflash_aux_logged", False):
+            logger.info(
+                "DFLASH aux at last-rank forward exit: pp_rank=%d slice=[%d,%d) "
+                "aux_count=%d aux_shapes=%s",
+                self.pp_group.rank_in_group,
+                self.start_layer,
+                self.end_layer,
+                len(aux_hidden_states),
+                [tuple(a.shape) for a in aux_hidden_states],
+            )
+            self._dflash_aux_logged = True
 
         if len(aux_hidden_states) == 0:
             return hidden_states

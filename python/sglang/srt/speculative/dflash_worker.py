@@ -1717,6 +1717,15 @@ class DFlashWorker:
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
+        # Pin capture_hidden_mode=FULL on the verify forward explicitly. The
+        # prefill path does this and works; for the decode-verify path the
+        # default flow would derive it from verify_input.capture_hidden_mode
+        # (also FULL), but pinning it directly here matches prefill exactly
+        # and removes one source of state divergence between the two paths.
+        # Without aux capture concatenation, the LogitsProcessor returns a
+        # bare [N, hidden_size] tensor and project_target_hidden trips at
+        # dflash.py:332 with the "feature dim mismatch" diagnostic.
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         need_mamba_verify_commit = hasattr(
             self.target_worker.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",

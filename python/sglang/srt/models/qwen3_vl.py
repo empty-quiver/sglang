@@ -1286,6 +1286,27 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
 
+        # First-iter visibility for the DFLASH PP aux flow at the
+        # last-rank LogitsProcessor entry point. If capture_aux is True
+        # but inner returned bare hidden_states, this is the smoking gun.
+        if (
+            self.capture_aux_hidden_states
+            and self.pp_group.is_last_rank
+            and not getattr(self, "_dflash_outer_aux_logged", False)
+        ):
+            logger.info(
+                "DFLASH outer forward (last rank): capture_aux=%s "
+                "inner_returned_tuple=%s aux_count=%s",
+                self.capture_aux_hidden_states,
+                aux_hidden_states is not None,
+                (
+                    len(aux_hidden_states)
+                    if aux_hidden_states is not None
+                    else 0
+                ),
+            )
+            self._dflash_outer_aux_logged = True
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
