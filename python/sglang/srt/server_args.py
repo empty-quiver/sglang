@@ -2402,8 +2402,17 @@ class ServerArgs:
                 )
 
             if self.pp_size != 1:
-                raise ValueError(
-                    "Currently DFLASH speculative decoding only supports pp_size == 1."
+                # DFLASH with PP follows a constrained partition: the draft model and
+                # lm_head live on the last PP rank, while embed_tokens lives on the
+                # first rank. Cross-rank IPC (embed lookups + aux hidden states) lets
+                # the drafter run on the lm_head rank only. See DFlashWorker for the
+                # IPC plumbing and qwen3_5/qwen3_vl for the aux-capture wiring.
+                logger.warning(
+                    "DFLASH speculative decoding with pp_size=%d uses the "
+                    "drafter-on-last-rank architecture (embedding+aux hidden "
+                    "states are shipped from PP rank 0 to the last rank). "
+                    "This is a new path; please report any issues.",
+                    self.pp_size,
                 )
 
             if self.speculative_draft_model_path is None:
@@ -5438,11 +5447,15 @@ class ServerArgs:
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         if self.pp_size > 1:
+            # DFLASH speculative decoding has a dedicated PP-aware path
+            # (drafter-on-last-rank, see DFlashWorker). All other speculative
+            # algorithms still require pp_size == 1.
+            speculative_pp_compatible = self.speculative_algorithm in (None, "DFLASH")
             assert (
                 self.disable_overlap_schedule
-                and self.speculative_algorithm is None
+                and speculative_pp_compatible
                 and not self.enable_mixed_chunk
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+            ), "Pipeline parallelism is not compatible with overlap schedule, non-DFLASH speculative decoding, mixed chunked prefill."
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
