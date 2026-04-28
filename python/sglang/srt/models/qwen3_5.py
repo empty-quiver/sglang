@@ -66,6 +66,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
@@ -684,8 +685,23 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
-        # Embedding layer
-        if self.pp_group.is_first_rank:
+        # Embedding layer.
+        #
+        # DFLASH speculative decoding needs the target's embedding table on
+        # the last PP rank (where the drafter and lm_head live) so the
+        # drafter can call target_model.get_input_embeddings(...) locally
+        # each draft step. When DFlash is active and pp_size > 1, we
+        # replicate embed_tokens on the last PP rank as well as the first.
+        # The cost is one vocab*hidden weight copy on the last rank
+        # (~2.5 GB BF16 for Qwen3.6-27B) in exchange for skipping a
+        # cross-rank embed-lookup IPC every draft block.
+        srv_args = get_global_server_args()
+        replicate_embed_for_dflash = (
+            getattr(srv_args, "speculative_algorithm", None) == "DFLASH"
+            and self.pp_group.world_size > 1
+            and self.pp_group.is_last_rank
+        )
+        if self.pp_group.is_first_rank or replicate_embed_for_dflash:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
