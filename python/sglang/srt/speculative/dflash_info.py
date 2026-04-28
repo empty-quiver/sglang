@@ -88,6 +88,16 @@ class DFlashDraftInput(SpecInput):
     # How many committed tokens are visible to the draft worker per request.
     draft_seq_lens: torch.Tensor
 
+    # Pre-built draft block for the NEXT decode iter. Filled by the drafter on PP1
+    # at the end of the prior iter (or during prefill drafter-prime). Delivered to
+    # PP0 on a 1-iter pipeline lag via the standard PP output ring. Both ranks read
+    # these at the start of decode forward to construct a DFlashVerifyInput without
+    # needing a parallel IPC channel. Shape: draft_token=[bs * block_size] int32,
+    # positions=[bs * block_size] int32. Both are device tensors. None until the
+    # drafter has produced its first block.
+    next_candidates: Optional[torch.Tensor] = None
+    next_positions: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
 
@@ -102,6 +112,17 @@ class DFlashDraftInput(SpecInput):
         self.verified_id = self.verified_id[new_indices]
         self.ctx_lens = old_ctx_lens[new_indices]
         self.draft_seq_lens = self.draft_seq_lens[new_indices]
+
+        # Filter pre-built drafter candidates if present. They are stored flattened
+        # as [old_bs * block_size]; reshape into [old_bs, block_size] to filter by row.
+        if self.next_candidates is not None and self.next_candidates.numel() > 0:
+            old_bs = int(old_ctx_lens.shape[0])
+            block_size = self.next_candidates.numel() // max(old_bs, 1)
+            cand_2d = self.next_candidates.view(old_bs, block_size)
+            self.next_candidates = cand_2d[new_indices].reshape(-1).contiguous()
+            if self.next_positions is not None and self.next_positions.numel() > 0:
+                pos_2d = self.next_positions.view(old_bs, block_size)
+                self.next_positions = pos_2d[new_indices].reshape(-1).contiguous()
 
         if old_target_hidden is None or old_target_hidden.numel() == 0:
             self.target_hidden = old_target_hidden
@@ -149,6 +170,31 @@ class DFlashDraftInput(SpecInput):
             self.target_hidden = torch.cat(
                 [self.target_hidden, spec_info.target_hidden], dim=0
             )
+
+        # Merge pre-built drafter candidates if both sides have them. If either side
+        # lacks them, drop both — the next forward will re-populate via drafter step
+        # on PP1 (and will deliver to PP0 via output ring on the iter after that).
+        if (
+            self.next_candidates is not None
+            and self.next_candidates.numel() > 0
+            and spec_info.next_candidates is not None
+            and spec_info.next_candidates.numel() > 0
+        ):
+            self.next_candidates = torch.cat(
+                [self.next_candidates, spec_info.next_candidates], dim=0
+            )
+            if (
+                self.next_positions is not None
+                and spec_info.next_positions is not None
+            ):
+                self.next_positions = torch.cat(
+                    [self.next_positions, spec_info.next_positions], dim=0
+                )
+            else:
+                self.next_positions = None
+        else:
+            self.next_candidates = None
+            self.next_positions = None
 
 
 @dataclass

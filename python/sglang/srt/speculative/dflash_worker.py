@@ -1,7 +1,7 @@
 import logging
 import math
 from copy import deepcopy
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -501,6 +501,88 @@ class DFlashWorker:
         # to flush here.
         pass
 
+    def pp_apply_follower_commit(
+        self,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        commit_lens: torch.Tensor,
+        committed_tokens: torch.Tensor,
+    ) -> None:
+        """PP=2 follower (PP0) post-verify bookkeeping.
+
+        Mirrors verify()'s side effects so PP0's allocator and per-req state
+        stay in lockstep with PP1 across iterations:
+          - free uncommitted target KV slots (allocated by prepare_for_verify)
+          - extend req.output_ids, call check_finished
+          - update seq_lens, seq_lens_cpu, seq_lens_sum
+          - update req_to_token mapping for newly committed slots
+          - bump spec_verify_ct / spec_accepted_tokens
+
+        Inputs are tensors received via the standard PP output ring:
+          commit_lens:      [bs] int32 (clamped to draft_token_num)
+          committed_tokens: [bs, draft_token_num] int64 (right-padded with garbage
+                            beyond commit_lens[i])
+        """
+        from sglang.srt.speculative.dflash_info import _compute_paged_keep_slots
+
+        bs = batch.batch_size()
+        device = batch.out_cache_loc.device
+        block_size = int(verify_input.draft_token_num)
+        commit_lens = commit_lens.to(device=device, dtype=torch.int32)
+        commit_lens_cpu = commit_lens.to("cpu").tolist()
+
+        out_cache_loc = batch.out_cache_loc.view(bs, block_size)
+        row_offsets = torch.arange(block_size, device=device)[None, :]
+        if self.page_size == 1:
+            keep_mask = row_offsets < commit_lens[:, None]
+            batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
+        else:
+            keep_slots = _compute_paged_keep_slots(
+                prefix_lens=batch.seq_lens,
+                commit_lens=commit_lens,
+                draft_token_num=block_size,
+                page_size=self.page_size,
+            )
+            batch.token_to_kv_pool_allocator.free(
+                out_cache_loc[row_offsets >= keep_slots[:, None]]
+            )
+            keep_mask = row_offsets < commit_lens[:, None]
+        batch.out_cache_loc = out_cache_loc[keep_mask]
+
+        if committed_tokens.device != device:
+            committed_tokens = committed_tokens.to(device, non_blocking=True)
+        committed_tokens_cpu = committed_tokens.to("cpu")
+        for i, req in enumerate(batch.reqs):
+            commit_len = int(commit_lens_cpu[i])
+            req.kv_committed_len += commit_len
+            req.kv_allocated_len = req.kv_committed_len
+            for j in range(commit_len):
+                token_id = int(committed_tokens_cpu[i, j].item())
+                req.output_ids.append(token_id)
+                req.check_finished()
+                if req.finished():
+                    break
+                if req.grammar is not None:
+                    req.grammar.accept_token(token_id)
+            req.spec_verify_ct += 1
+            req.spec_accepted_tokens += max(0, commit_len - 1)
+
+        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
+        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu.add_(
+                torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+            )
+        batch.seq_lens_sum += sum(commit_lens_cpu)
+
     def _gather_req_to_token_masked(
         self,
         *,
@@ -671,38 +753,17 @@ class DFlashWorker:
 
         return int(resolved_id)
 
-    def _prepare_for_speculative_decoding(
+    def _run_drafter_for_next_iter(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput
-    ):
-        rank = self.pp_group.rank_in_group
-        _dflash_dbg(
-            rank,
-            f"prepare_for_spec_decoding ENTER mode={batch.forward_mode.name} "
-            f"bs={batch.batch_size()}",
-        )
-        if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
-            _dflash_dbg(
-                rank,
-                "prepare_for_spec_decoding EARLY RETURN (extend/idle)",
-            )
-            return
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the drafter for the next iter's candidate block.
 
-        if batch.has_grammar:
-            raise RuntimeError(
-                "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
-            )
-        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            if (
-                not is_dflash_sampling_verify_available()
-                and not self._warned_sampling_fallback
-                and self.tp_rank == 0
-            ):
-                logger.warning(
-                    "DFLASH non-greedy verification is unavailable on this build/device; "
-                    "falling back to greedy argmax verification."
-                )
-                self._warned_sampling_fallback = True
-
+        Returns (draft_tokens_flat, positions_flat), both shape [bs * block_size].
+        Drafter-only side effect: appends newly committed tokens into the draft
+        KV cache (must run before the drafter forward). Does NOT mutate `batch`.
+        Called on PP1 only (the drafter rank): post-verify in decode, and at the
+        end of prefill ("drafter prime") to seed the first decode iter.
+        """
         bs = batch.batch_size()
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
@@ -838,10 +899,47 @@ class DFlashWorker:
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+
+        # The buffers above (_draft_block_*_buf) are reused on every iter, so we
+        # must clone the slices the caller will hold onto before the next call
+        # rewrites them. The output ring will also reference the candidates from
+        # PP1's GenerationBatchResult between iters, so a shared buffer would
+        # be unsafe even on a single rank.
+        return (
+            draft_tokens.reshape(-1).clone(),
+            positions_2d.reshape(-1).clone(),
+        )
+
+    def _prepare_verify_from_candidates(
+        self,
+        batch: ScheduleBatch,
+        draft_tokens: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> DFlashVerifyInput:
+        """Build a DFlashVerifyInput from prebuilt drafter candidates and mutate
+        `batch` to TARGET_VERIFY mode. Called on BOTH ranks at the start of a
+        decode iter to set up a symmetric target verify forward — PP0 reads the
+        candidates that arrived on the output ring, PP1 reads the ones it just
+        produced and stashed on draft_input.
+        """
+        if batch.has_grammar:
+            raise RuntimeError(
+                "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
+            )
+        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
+            if (
+                not is_dflash_sampling_verify_available()
+                and not self._warned_sampling_fallback
+                and self.tp_rank == 0
+            ):
+                logger.warning(
+                    "DFLASH non-greedy verification is unavailable on this build/device; "
+                    "falling back to greedy argmax verification."
+                )
+                self._warned_sampling_fallback = True
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
+            draft_token=draft_tokens,
             positions=positions,
             draft_token_num=self.block_size,
         )
@@ -861,11 +959,7 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
-        _dflash_dbg(
-            rank,
-            f"prepare_for_spec_decoding EXIT verify_input.draft_token.shape="
-            f"{tuple(verify_input.draft_token.shape)}",
-        )
+        return verify_input
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1521,36 +1615,29 @@ class DFlashWorker:
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
             )
 
-        if not self.is_drafter_rank:
-            # Non-last PP ranks: forward the target slice and let the
-            # scheduler relay the resulting PPProxyTensors to the next
-            # stage. We still enable aux capture in extend mode so the
-            # last rank receives the captured aux for layers local to
-            # this rank via the carrier.
-            if isinstance(batch, ModelWorkerBatch):
-                model_worker_batch = batch
-            else:
-                model_worker_batch = batch.get_model_worker_batch()
-                if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-                    model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            ret = self.target_worker.forward_batch_generation(
-                model_worker_batch, **kwargs
-            )
-            _dflash_dbg(_rank, "non-drafter generic path EXIT")
-            return ret
-
         if isinstance(batch, ModelWorkerBatch):
             # Should not happen for spec-v1 (non-overlap) scheduling, but keep a sane fallback.
-            _dflash_dbg(_rank, "drafter rank fallback ModelWorkerBatch passthrough")
+            _dflash_dbg(_rank, "fallback ModelWorkerBatch passthrough")
             return self.target_worker.forward_batch_generation(batch, **kwargs)
 
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        is_extend = batch.forward_mode.is_extend() or batch.is_extend_in_batch
+
+        # ----------------------- Prefill branch -------------------------
+        if is_extend:
             model_worker_batch = batch.get_model_worker_batch()
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, **kwargs
             )
+            if not self.is_drafter_rank:
+                # PP0 prefill: target forward already sent the proxy chain (aux
+                # capture for layers 0-7 + hidden_states+residual) to PP1. The
+                # scheduler will then send PPProxyTensors as the iter's output.
+                # Nothing else to do here.
+                _dflash_dbg(_rank, "fwd_batch_gen EXIT (prefill non-drafter)")
+                return batch_result
+
+            # PP1 (drafter rank) prefill.
             logits_output, next_token_ids = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
@@ -1560,7 +1647,6 @@ class DFlashWorker:
                     "DFLASH requires target aux hidden capture for prefill, but got None. "
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
-
             if (
                 model_worker_batch.extend_seq_lens is None
                 or model_worker_batch.extend_prefix_lens is None
@@ -1569,8 +1655,6 @@ class DFlashWorker:
                     "DFLASH expected extend_seq_lens / extend_prefix_lens to be populated in extend mode, but got None."
                 )
 
-            # Materialize the prompt tokens into the draft KV cache immediately. This is required
-            # for radix cache support, since the scheduler may update radix after prefill returns.
             device = next_token_ids.device
 
             def _to_int32_device_tensor(x, *, device=device):
@@ -1593,40 +1677,91 @@ class DFlashWorker:
                     else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
                 ),
             )
-            self._append_target_hidden_to_draft_kv(batch, draft_input)
+
+            # Drafter prime: produce iter-0 candidates here so the first decode
+            # iter on both ranks has them ready. _run_drafter_for_next_iter
+            # appends the target hidden into the draft KV cache as part of its
+            # setup, so we don't need a separate _append_target_hidden_to_draft_kv
+            # call here.
+            next_candidates, next_positions = self._run_drafter_for_next_iter(
+                batch, draft_input
+            )
+            draft_input.next_candidates = next_candidates
+            draft_input.next_positions = next_positions
             batch.spec_info = draft_input
 
-            _dflash_dbg(_rank, "fwd_batch_gen EXIT (prefill drafter rank)")
+            _dflash_dbg(
+                _rank,
+                "fwd_batch_gen EXIT (prefill drafter) "
+                f"primed_candidates_shape={tuple(next_candidates.shape)}",
+            )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 num_accepted_tokens=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                dflash_next_candidates=next_candidates,
+                dflash_next_positions=next_positions,
             )
 
-        # Decode / target-verify stage.
+        # ----------------------- Decode branch --------------------------
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInput):
             raise RuntimeError(
                 "DFLASH decode requires DFlashDraftInput state on the running batch. "
                 "This usually means the request did not complete the prefill stage."
             )
+        if (
+            draft_input.next_candidates is None
+            or draft_input.next_positions is None
+        ):
+            raise RuntimeError(
+                "DFLASH decode missing pre-built next_candidates/next_positions. "
+                "PP1's drafter must produce these (prefill drafter-prime or prior "
+                "decode iter) and the standard PP output ring must deliver them to "
+                "PP0 before this forward."
+            )
 
-        self._prepare_for_speculative_decoding(batch, draft_input)
+        bs = batch.batch_size()
+        expected = bs * self.block_size
+        if int(draft_input.next_candidates.numel()) != expected:
+            raise RuntimeError(
+                f"DFLASH decode candidates mismatch: bs={bs} block_size={self.block_size} "
+                f"expected={expected} got={int(draft_input.next_candidates.numel())}"
+            )
+
+        verify_input = self._prepare_verify_from_candidates(
+            batch,
+            draft_tokens=draft_input.next_candidates,
+            positions=draft_input.next_positions,
+        )
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
-        verify_input = model_worker_batch.spec_info
-        assert isinstance(verify_input, DFlashVerifyInput)
-        # Pin capture_hidden_mode=FULL on the verify forward explicitly. The
-        # prefill path does this and works; for the decode-verify path the
-        # default flow would derive it from verify_input.capture_hidden_mode
-        # (also FULL), but pinning it directly here matches prefill exactly
-        # and removes one source of state divergence between the two paths.
-        # Without aux capture concatenation, the LogitsProcessor returns a
-        # bare [N, hidden_size] tensor and project_target_hidden trips at
-        # dflash.py:332 with the "feature dim mismatch" diagnostic.
+        # Pin capture_hidden_mode=FULL: without it the LogitsProcessor returns a
+        # bare [N, hidden_size] tensor and project_target_hidden on the drafter
+        # trips at dflash.py:332 with the feature-dim mismatch diagnostic.
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+
+        _dflash_dbg(_rank, "decode target_verify_fwd START")
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True, **kwargs
+        )
+        _dflash_dbg(_rank, "decode target_verify_fwd DONE")
+
+        if not self.is_drafter_rank:
+            # PP0 decode: target_verify forward sent the proxy chain to PP1.
+            # No verify post-processing, no drafter step. Return the result as-is
+            # so the scheduler relays PPProxyTensors via _pp_send_dict_to_next_stage
+            # and consumes the output ring delivery from PP1's prior iter.
+            _dflash_dbg(_rank, "fwd_batch_gen EXIT (decode non-drafter)")
+            return batch_result
+
+        # PP1 (drafter rank) decode post-processing.
+        logits_output, can_run_cuda_graph = (
+            batch_result.logits_output,
+            batch_result.can_run_cuda_graph,
+        )
         need_mamba_verify_commit = hasattr(
             self.target_worker.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
@@ -1634,17 +1769,14 @@ class DFlashWorker:
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
-
-        _dflash_dbg(_rank, "decode target_verify_fwd START")
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
+        # Snapshot per-req output_ids length BEFORE verify() so we can recover
+        # exactly which tokens were appended this iter and ship them to PP0
+        # via the output ring (PP0 mirrors verify()'s output_ids/seq_lens
+        # update through pp_apply_follower_commit).
+        is_pp = self.pp_group.world_size > 1
+        pre_verify_output_lens = (
+            [len(req.output_ids) for req in batch.reqs] if is_pp else None
         )
-        _dflash_dbg(_rank, "decode target_verify_fwd DONE")
-        logits_output, can_run_cuda_graph = (
-            batch_result.logits_output,
-            batch_result.can_run_cuda_graph,
-        )
-
         (
             new_verified_id,
             commit_lens,
@@ -1663,12 +1795,18 @@ class DFlashWorker:
                 commit_lens=commit_lens,
             )
 
-        # Update draft state for the next iteration. Also materialize the committed verify tokens
-        # into the draft KV cache immediately so radix cache entries are safe to reuse.
+        # Update draft state for the NEXT iter's drafter step.
         draft_input.verified_id = new_verified_id
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
-        self._append_target_hidden_to_draft_kv(batch, draft_input)
+        # Run drafter to produce candidates for the iter AFTER this one. The
+        # drafter helper appends the target hidden into the draft KV cache as
+        # the first step, so we don't append here.
+        next_candidates, next_positions = self._run_drafter_for_next_iter(
+            batch, draft_input
+        )
+        draft_input.next_candidates = next_candidates
+        draft_input.next_positions = next_positions
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
@@ -1680,9 +1818,33 @@ class DFlashWorker:
             )
             self._logged_first_verify = True
 
+        # Build PP0 commit payload: per-req commit_lens (already a tensor) and
+        # the actual committed tokens this iter (right-padded to block_size).
+        # PP0 reads these off the output ring and applies them to its own
+        # batch via pp_apply_follower_commit.
+        if is_pp:
+            bs_pp = batch.batch_size()
+            block_size = int(self.block_size)
+            committed_tokens = torch.zeros(
+                (bs_pp, block_size), dtype=torch.int64, device=self.device
+            )
+            assert pre_verify_output_lens is not None
+            for i, req in enumerate(batch.reqs):
+                new_tokens = req.output_ids[pre_verify_output_lens[i]:]
+                n = min(len(new_tokens), block_size)
+                if n > 0:
+                    committed_tokens[i, :n] = torch.tensor(
+                        new_tokens[:n], dtype=torch.int64, device=self.device
+                    )
+            dflash_commit_lens = commit_lens.to(torch.int32)
+            dflash_committed_tokens = committed_tokens
+        else:
+            dflash_commit_lens = None
+            dflash_committed_tokens = None
+
         _dflash_dbg(
             _rank,
-            f"fwd_batch_gen EXIT (decode) accept_length_per_req={accept_length_per_req_cpu}",
+            f"fwd_batch_gen EXIT (decode drafter) accept_length_per_req={accept_length_per_req_cpu}",
         )
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -1690,4 +1852,8 @@ class DFlashWorker:
             num_accepted_tokens=num_accepted_tokens,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
+            dflash_next_candidates=next_candidates,
+            dflash_next_positions=next_positions,
+            dflash_commit_lens=dflash_commit_lens,
+            dflash_committed_tokens=dflash_committed_tokens,
         )

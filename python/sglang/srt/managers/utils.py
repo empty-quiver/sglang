@@ -47,6 +47,17 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # DFLASH spec-v1 PP=2 plumbing: candidates produced by PP1's drafter for the
+    # NEXT decode iter, piggybacked on the standard PP output ring so PP0 can
+    # build its verify_input symmetrically without a parallel IPC channel.
+    # `commit_lens` and `committed_tokens` carry verify()'s post-sample state
+    # so PP0 can mirror the output_ids/seq_lens/KV-free bookkeeping. All four
+    # are None outside DFLASH and outside PP=2.
+    dflash_next_candidates: Optional[torch.Tensor] = None
+    dflash_next_positions: Optional[torch.Tensor] = None
+    dflash_commit_lens: Optional[torch.Tensor] = None
+    dflash_committed_tokens: Optional[torch.Tensor] = None
+
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
