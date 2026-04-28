@@ -757,7 +757,18 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        # Pre-load aux hidden states captured on previous PP ranks (if any),
+        # so the captured layer order is preserved end-to-end.
+        # Tensors are stored as "aux_hidden_states_<idx>" in the carrier.
+        aux_hidden_states: list[torch.Tensor] = []
+        if pp_proxy_tensors is not None and not self.pp_group.is_first_rank:
+            idx = 0
+            while True:
+                key = f"aux_hidden_states_{idx}"
+                if key not in pp_proxy_tensors.tensors:
+                    break
+                aux_hidden_states.append(pp_proxy_tensors[key])
+                idx += 1
         # Pass through decoder layers (PP-local range only)
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -789,12 +800,13 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            for idx, aux in enumerate(aux_hidden_states):
+                tensors[f"aux_hidden_states_{idx}"] = aux
+            return PPProxyTensors(tensors)
 
         # Apply final normalization
         if hidden_states.shape[0] != 0:
