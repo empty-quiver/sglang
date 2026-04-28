@@ -133,6 +133,35 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                # DFLASH PP decode iters block inside _pp_launch_batch on
+                # the cross-rank candidate recv (DFlashWorker._pp_dflash_recv_with_marker).
+                # Without this early flush, PP1 would still be parked at
+                # the prior iteration's output-ring recv from PP0 waiting
+                # for PP0 to forward `pp_outputs` (`{next_token_ids}` from
+                # prefill), and that send is normally deferred until line
+                # 153 (after _pp_launch_batch). Run the output-ring
+                # send/recv up front for DFlash decode iters so PP1 can
+                # progress to its own iter and reach the candidate send.
+                # Set a flag so the post-launch path knows to skip the
+                # standard ring this iter.
+                _pp_dflash_did_early_output_ring = False
+                if (
+                    self.server_args.pp_async_batch_depth == 0
+                    and dflash_pp_decode
+                ):
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                    _pp_dflash_did_early_output_ring = True
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} dflash_pp_decode early output-ring "
+                        f"flush done",
+                        flush=True,
+                    )
                 if self.cur_batch:
                     print(
                         f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
@@ -150,20 +179,41 @@ class SchedulerPPMixin:
                         f"mb_id={mb_id} _pp_launch_batch DONE",
                         flush=True,
                     )
-                if self.server_args.pp_async_batch_depth == 0:
+                if (
+                    self.server_args.pp_async_batch_depth == 0
+                    and not _pp_dflash_did_early_output_ring
+                ):
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
                         )
                     )
-                if self.mbs[next_mb_id] is not None:
+                # Skip downstream batch_result processing for DFLASH decode
+                # batches: my _pp_send_recv_and_preprocess_output_tensors gate
+                # bypasses the recv for them, so d2h_event/next_batch_result
+                # are None and there is nothing to process here. PP0's
+                # DFlashWorker._pp_apply_follower_commit already updates
+                # req.output_ids; per-batch finished detection still flows
+                # through the normal scheduler flush downstream.
+                _next_mb_dflash_decode = self._pp_dflash_pp_decode_batch(
+                    self.mbs[next_mb_id]
+                )
+                if (
+                    self.mbs[next_mb_id] is not None
+                    and not _next_mb_dflash_decode
+                ):
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
                         )
+                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                elif self.mbs[next_mb_id] is not None and _next_mb_dflash_decode:
+                    # Track last_mbs even when we skip the formal output
+                    # ring so the next iter's last_batch logic stays in
+                    # sync with non-DFlash flows.
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch and not dflash_pp_decode:
@@ -1085,9 +1135,31 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
         send_output_work = []
+        # DFLASH PP decode batches drive their next_token_ids in-band via
+        # DFlashWorker._pp_apply_follower_commit; the standard output-ring
+        # send from PP1 (popleft + send_dict_to_next_stage) is redundant
+        # for them. Skip the last-rank pop/send so we dont put a stale
+        # {next_token_ids} dict on the PP0<->PP1 channel that DFlashs
+        # marker IPC is using.
+        #
+        # PP0s non-last-rank send (forwarding pp_outputs from a prior
+        # non-DFlash batch) is NOT gated here: it carries data the PP1
+        # output-ring recv still needs (e.g. the prefill {next_token_ids}
+        # that the prior iteration handed PP0). Without this, PP1 is
+        # stuck at _pp_recv_dict_from_prev_stage waiting for PP0 to
+        # forward what PP0 already received from PP1, and the wait makes
+        # PP0s next-iter DFlash IPC unable to make progress because the
+        # send happens after _pp_launch_batch (which is the IPC).
+        last_rank_skip_dflash_decode = (
+            mbs[next_first_rank_mb_id] is not None
+            and self._pp_dflash_pp_decode_batch(mbs[next_first_rank_mb_id])
+        )
         if self.pp_group.is_last_rank:
             # send ready PP output to rank 0
-            if mbs[next_first_rank_mb_id] is not None:
+            if (
+                mbs[next_first_rank_mb_id] is not None
+                and not last_rank_skip_dflash_decode
+            ):
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
                     torch.cuda.current_stream().wait_event(q_event)
@@ -1125,7 +1197,18 @@ class SchedulerPPMixin:
             pp_outputs,
         )
 
-        if mbs[next_mb_id] is not None:
+        # DFLASH PP decode batches handle their output processing in-band
+        # via DFlashWorker.fwd_batch_gen + _pp_apply_follower_commit. The
+        # standard output ring recv would block here forever (PP0 has
+        # nothing to forward because it skips the corresponding send) and
+        # would also corrupt the `{draft_token, ...}` payload PP0 expects
+        # from its DFlash IPC recv if any send did sneak through.
+        # Symmetric skip on both ranks based on mbs[next_mb_id].
+        skip_dflash_decode_recv = (
+            mbs[next_mb_id] is not None
+            and self._pp_dflash_pp_decode_batch(mbs[next_mb_id])
+        )
+        if mbs[next_mb_id] is not None and not skip_dflash_decode_recv:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = None
                 if not mbs[next_mb_id].forward_mode.is_prebuilt():
@@ -1160,15 +1243,24 @@ class SchedulerPPMixin:
                 event = torch.cuda.Event()
                 event.record(torch.cuda.current_stream())
                 if self.pp_group.is_last_rank:
-                    # (last rank) buffer the outputs for async batch depth
-                    last_rank_comm_queue.append(
-                        (
-                            event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, self.cur_batch)
-                            ),
+                    # (last rank) buffer the outputs for async batch depth.
+                    # Skip queueing for DFLASH PP decode batches: their
+                    # next_token_ids were already shipped to PP0 via the
+                    # commit IPC inside DFlashWorker. Sending them again
+                    # via the standard output ring would put a stale dict
+                    # on the PP0<->PP1 channel that DFlashs marker-IPC
+                    # is sharing.
+                    if not self._pp_dflash_pp_decode_batch(self.cur_batch):
+                        last_rank_comm_queue.append(
+                            (
+                                event,
+                                PPProxyTensors(
+                                    self._pp_prepare_tensor_dict(
+                                        result, self.cur_batch
+                                    )
+                                ),
+                            )
                         )
-                    )
         return result, event
 
     def get_rids(
