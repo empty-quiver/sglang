@@ -5,7 +5,7 @@ from typing import Optional, Union
 
 import torch
 
-from sglang.srt.distributed import get_pp_group, get_tp_group
+from sglang.srt.distributed import get_pp_group, get_tp_group, get_world_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -30,7 +30,11 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import (
+    broadcast_pyobj,
+    get_available_gpu_memory,
+    is_cuda,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +110,12 @@ class DFlashWorker:
         self._logged_first_verify = False
 
         if not self.is_drafter_rank:
-            # Skip drafter init entirely on non-last PP ranks. The DFlashWorker
-            # acts purely as a pass-through to target_worker so the PP scheduler
-            # loop can run unchanged: forward_batch_generation returns the
-            # target's PPProxyTensors carrier, which the scheduler relays to
-            # the next pipeline stage.
+            # Skip drafter model construction on non-last PP ranks but
+            # mirror the world-group collectives the drafter rank's
+            # TpModelWorker(...).__init__ -> ModelRunner.__init__ ->
+            # initialize() pipeline issues. Without this PP1 hangs on its
+            # first all_reduce on world_group.cpu_group while PP0 sits
+            # idle here.
             self.draft_worker = None
             self.draft_model_runner = None
             self.draft_model = None
@@ -153,11 +158,13 @@ class DFlashWorker:
             self._fused_kv_helper = None
             if self.tp_rank == 0:
                 logger.info(
-                    "DFLASH PP rank %d/%d: drafter init skipped on non-last rank; "
-                    "this rank only forwards target slices.",
+                    "DFLASH PP rank %d/%d: drafter model load skipped; "
+                    "mirroring drafter init collectives so PP%d can proceed.",
                     self.pp_group.rank_in_group,
                     self.pp_group.world_size,
+                    self.pp_group.world_size - 1,
                 )
+            self._pp_drafter_init_collective_stub(server_args, tp_rank)
             return
 
         # Draft runner (separate KV cache + attention backend).
@@ -303,6 +310,63 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+    def _pp_drafter_init_collective_stub(
+        self, server_args: ServerArgs, tp_rank: int
+    ) -> None:
+        """Mirror world-group collectives the drafter rank issues during init.
+
+        On the drafter (last) PP rank, instantiating
+        TpModelWorker(... is_draft_worker=True) drives ModelRunner.__init__
+        -> initialize() which calls into init_torch_distributed() and
+        init_memory_pool() / profile_max_num_token(). Each of those issues
+        an all_reduce on world_group.cpu_group; TpModelWorker.__init__
+        then broadcasts random_seed from rank 0 over the same group.
+
+        Non-last ranks skip drafter model construction (no GPU memory for
+        an unused 3.46 GB drafter copy) but must still participate in
+        these collectives or PP1's first all_reduce hangs forever.
+
+        Order matches drafter init exactly:
+          1) get_available_gpu_memory(distributed=True, ...)   [init_torch_distributed line ~884]
+          2) get_available_gpu_memory(distributed=True, ...)   [profile_max_num_token line ~119]
+          3) all_reduce(int64, MIN, world.cpu_group)           [init_memory_pool line ~411, gated on pp_size>1]
+          4) broadcast_pyobj([random_seed], src=world.ranks[0], world.cpu_group)
+                                                               [TpModelWorker.__init__ line ~297]
+        """
+        world_group = get_world_group()
+        cpu_group = world_group.cpu_group
+
+        # 1) init_torch_distributed line 884
+        get_available_gpu_memory(
+            self.target_worker.device,
+            self.gpu_id,
+            distributed=world_group.world_size > 1,
+            cpu_group=cpu_group,
+        )
+        # 2) profile_max_num_token (called from init_memory_pool)
+        get_available_gpu_memory(
+            self.target_worker.device,
+            self.gpu_id,
+            distributed=world_group.world_size > 1,
+            cpu_group=cpu_group,
+        )
+        # 3) init_memory_pool line 411 (only fires when pp_size > 1, which
+        #    is the only configuration where this stub is reached).
+        if server_args.pp_size > 1:
+            tensor = torch.tensor(0, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=cpu_group,
+            )
+        # 4) TpModelWorker.__init__ random_seed broadcast.
+        broadcast_pyobj(
+            [server_args.random_seed],
+            server_args.tp_size * self.pp_group.rank_in_group + tp_rank,
+            cpu_group,
+            src=world_group.ranks[0],
+        )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
