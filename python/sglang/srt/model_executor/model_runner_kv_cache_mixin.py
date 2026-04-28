@@ -187,6 +187,26 @@ class ModelRunnerKVCacheMixin:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
 
+            # On heterogeneous Pipeline Parallel deployments (different GPUs per
+            # PP rank, or asymmetric layer partitions) each rank sees a different
+            # `total_rest_memory`. The Mamba cache is conceptually shared per
+            # request across PP ranks, so a per-rank auto-size diverges, and the
+            # rank with the smallest leftover budget collapses to ~0 — which then
+            # cascades into max_num_reqs == 0 and the
+            # "max_running_request is zero" assertion in tp_worker.
+            #
+            # Min-reduce `total_rest_memory` across PP so every rank computes the
+            # same feasible mamba cache size (bounded by the tightest rank).
+            if self.pp_size > 1:
+                from sglang.srt.distributed.parallel_state import get_world_group
+                t = torch.tensor(total_rest_memory, dtype=torch.float64)
+                torch.distributed.all_reduce(
+                    t,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=get_world_group().cpu_group,
+                )
+                total_rest_memory = t.item()
+
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
             # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
