@@ -29,12 +29,13 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -803,15 +804,19 @@ class Qwen3NextModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.pp_group = get_pp_group()
 
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
-        )
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         def get_layer(idx: int, prefix: str):
             layer_class = ALL_DECODER_LAYER_TYPES[config.layers_block_type[idx]]
@@ -827,11 +832,18 @@ class Qwen3NextModel(nn.Module):
                 alt_stream=alt_stream,
             )
 
-        self.layers = make_layers(
-            config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            get_layer,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=f"{prefix}.layers",
         )
 
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
         self.infer_count = 0
 
         # For EAGLE3 support
@@ -849,19 +861,25 @@ class Qwen3NextModel(nn.Module):
         forward_batch: ForwardBatch,
         # mamba_cache_params: MambaCacheParams,
         inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
 
         # pass a sequence index tensor, that is required for
         # proper continuous batching computation including
         # chunked prefill
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if self.pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+            residual = None
         else:
-            hidden_states = self.embed_tokens(input_ids)
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
 
-        residual = None
         aux_hidden_states = []
-        for i in range(len(self.layers)):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
@@ -876,6 +894,14 @@ class Qwen3NextModel(nn.Module):
                         else None
                     ),
                 )
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -917,7 +943,6 @@ class Qwen3NextForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.pp_group = get_pp_group()
-        assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
 
         # The quant config's packed_modules_mapping may be None if it wasn't
         # in the checkpoint config. The base class (QuantizationConfig) intends
@@ -930,14 +955,17 @@ class Qwen3NextForCausalLM(nn.Module):
         self.model = Qwen3NextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            org_num_embeddings=config.vocab_size,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                org_num_embeddings=config.vocab_size,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -946,7 +974,8 @@ class Qwen3NextForCausalLM(nn.Module):
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+                if hasattr(layer, "mlp")
+                and isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
             }
         )
 
@@ -961,17 +990,27 @@ class Qwen3NextForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            inputs_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1042,6 +1081,18 @@ class Qwen3NextForCausalLM(nn.Module):
                 continue
 
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            # Skip layers on other PP ranks.
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
                 continue
 
             if ".self_attn." in name:
