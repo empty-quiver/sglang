@@ -34,11 +34,16 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-if is_flashinfer_available() and is_sm120_supported():
-    from flashinfer import fp4_quantize
-elif is_cuda_alike():
-    from sgl_kernel import scaled_fp4_quant as fp4_quantize
-else:
+try:
+    if is_flashinfer_available() and is_sm120_supported():
+        from flashinfer import fp4_quantize
+    elif is_cuda_alike():
+        from sgl_kernel import scaled_fp4_quant as fp4_quantize
+    else:
+        fp4_quantize = None
+except ImportError:
+    # sgl_kernel built without FP4 (default; FP4 is a Blackwell-only kernel
+    # we never need on Ada). Silence the import so MoE runner module loads.
     fp4_quantize = None
 
 
