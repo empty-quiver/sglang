@@ -90,9 +90,19 @@ class SchedulerPPMixin:
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                # DFlash + PP decode batches drive their own cross-rank IPC
+                # inside DFlashWorker.forward_batch_generation (candidates
+                # PP1->PP0, verify hidden PP0->PP1, commit_lens PP1->PP0).
+                # The scheduler's standard PP proxy chain would deadlock for
+                # these since PP0's verify hidden depends on candidates that
+                # only exist after PP1's drafter step. Skip the chain.
+                dflash_pp_decode = self._pp_dflash_pp_decode_batch(self.cur_batch)
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if not dflash_pp_decode:
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    else:
+                        pp_proxy_tensors = None
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -127,7 +137,7 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
+                    if self.cur_batch and not dflash_pp_decode:
                         torch.cuda.current_stream().wait_event(self.launch_event)
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
@@ -948,6 +958,33 @@ class SchedulerPPMixin:
                 )
             )
         return pp_proxy_tensors
+
+    def _pp_dflash_pp_decode_batch(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> bool:
+        """Return True iff the current batch is a DFlash decode batch under PP.
+
+        For these batches DFlashWorker.forward_batch_generation drives its own
+        cross-rank IPC (candidates PP1->PP0, verify hidden PP0->PP1,
+        commit_lens PP1->PP0). The standard PP proxy chain is incompatible
+        with this dance because PP0's verify hidden depends on candidates
+        that only exist after PP1's drafter step. The PP loop must skip its
+        recv/send for these batches; DFlashWorker takes responsibility for
+        keeping the channel synchronized.
+        """
+        if batch is None:
+            return False
+        if self.pp_size <= 1:
+            return False
+        if not self.spec_algorithm.is_dflash():
+            return False
+        forward_mode = batch.forward_mode
+        if forward_mode is None:
+            return False
+        # Skip the chain only for decode (and the implicit IDLE that may pair
+        # with a decode microbatch). Extend / prefill keeps the standard
+        # chain so aux capture flows naturally.
+        return forward_mode.is_decode() or forward_mode.is_idle()
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
