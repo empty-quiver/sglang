@@ -72,6 +72,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -678,6 +679,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
             )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
@@ -695,15 +698,19 @@ class Qwen3_5ForCausalLM(nn.Module):
                 alt_stream=alt_stream,
             )
 
-        self.layers = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             get_layer,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -730,8 +737,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        # Pass through decoder layers
-        for layer_idx in range(len(self.layers)):
+        # Pass through decoder layers (PP-local range only)
+        for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
@@ -786,6 +793,19 @@ class Qwen3_5ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            # Skip layers on other PP ranks. Hits before any name remap so the
+            # layer index in the checkpoint name is what we test against.
+            _layer_id = get_layer_id(name)
+            if (
+                _layer_id is not None
+                and hasattr(self, "model")
+                and hasattr(self.model, "start_layer")
+                and (
+                    _layer_id < self.model.start_layer
+                    or _layer_id >= self.model.end_layer
+                )
+            ):
                 continue
             if "mtp" in name:
                 continue
@@ -907,6 +927,19 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            # Skip layers on other PP ranks. Hits before any name remap so the
+            # layer index in the checkpoint name is what we test against.
+            _layer_id = get_layer_id(name)
+            if (
+                _layer_id is not None
+                and hasattr(self, "model")
+                and hasattr(self.model, "start_layer")
+                and (
+                    _layer_id < self.model.start_layer
+                    or _layer_id >= self.model.end_layer
+                )
+            ):
                 continue
             if "mtp" in name:
                 continue
@@ -1068,6 +1101,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            # Skip layers on other PP ranks. Hits before any name remap so the
+            # layer index in the checkpoint name is what we test against.
+            _layer_id = get_layer_id(name)
+            if (
+                _layer_id is not None
+                and hasattr(self, "model")
+                and hasattr(self.model, "start_layer")
+                and (
+                    _layer_id < self.model.start_layer
+                    or _layer_id >= self.model.end_layer
+                )
+            ):
                 continue
             if "mtp" in name:
                 continue
@@ -1244,6 +1290,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            # Skip layers on other PP ranks. Hits before any name remap so the
+            # layer index in the checkpoint name is what we test against.
+            _layer_id = get_layer_id(name)
+            if (
+                _layer_id is not None
+                and hasattr(self, "model")
+                and hasattr(self.model, "start_layer")
+                and (
+                    _layer_id < self.model.start_layer
+                    or _layer_id >= self.model.end_layer
+                )
+            ):
                 continue
             if "mtp" in name:
                 continue
