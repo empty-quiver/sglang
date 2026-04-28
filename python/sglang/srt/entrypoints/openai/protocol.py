@@ -1119,9 +1119,13 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
-    )
+    # Codex CLI (and standard OpenAI Responses) sends type="function" with
+    # name/description/parameters fields. Upstream sglang only allows
+    # web_search_preview/code_interpreter; relax type to str and accept
+    # extra fields so function tools pass validation.
+    type: str = Field(description="Type of tool")
+
+    model_config = {"extra": "allow"}
 
 
 ResponseInputOutputItem: TypeAlias = Union[
