@@ -23,6 +23,7 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -90,11 +91,45 @@ class RadixAttention(nn.Module):
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if self.quant_method is not None:
             self.quant_method.create_weights(self)
+        elif (
+            self.k_scale_float is None
+            and self.v_scale_float is None
+            and get_global_server_args().kv_cache_dtype != "auto"
+        ):
+            # The user opted into a quantized KV cache (e.g. fp8_e5m2) but
+            # the loaded checkpoint provides no per-layer K/V scales, so no
+            # BaseKVCacheMethod is attached. Several attention backends
+            # (flashattention/fa3, flashinfer, trtllm) gate their fp8
+            # read/dequant path on `layer.k_scale is not None` and silently
+            # fall back to bf16 reads otherwise, defeating the whole point
+            # of the cache. Default to unit scale here so those backends
+            # actually exercise their fp8 path.
+            self._set_default_kv_scales()
         self.attn_type = attn_type
 
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+
+    def _set_default_kv_scales(self) -> None:
+        """Default the K/V dequant scales to 1.0.
+
+        This mirrors the no-checkpoint-scales path of
+        ``BaseKVCacheMethod.process_weights_after_loading`` and is safe for
+        ``fp8_e5m2``, whose 5-bit exponent already covers the bf16 dynamic
+        range -- values just round-trip through fp8 without rescaling.
+        ``fp8_e4m3`` would benefit from per-layer calibrated scales for
+        accuracy, but that path is gated by hardware support (sm_89+) and
+        is orthogonal to enabling the fp8 read path in the first place.
+        """
+        self.k_scale = torch.nn.Parameter(
+            torch.tensor(1.0, dtype=torch.float32), requires_grad=False
+        )
+        self.v_scale = torch.nn.Parameter(
+            torch.tensor(1.0, dtype=torch.float32), requires_grad=False
+        )
+        self.k_scale_float = 1.0
+        self.v_scale_float = 1.0
 
     def forward(
         self,
