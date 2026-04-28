@@ -5,7 +5,7 @@ from typing import Optional, Union
 
 import torch
 
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_pp_group, get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -48,7 +48,22 @@ def _get_fused_kv_materialize_helper():
 
 
 class DFlashWorker:
-    """DFlash speculative decoding worker (spec-v1, tp>=1/pp=1)."""
+    """DFlash speculative decoding worker (spec-v1, tp>=1, pp>=1).
+
+    Pipeline-parallel layout: when pp_size > 1, the drafter and lm_head
+    live exclusively on the last PP rank. Earlier PP ranks own only the
+    target slice. Their DFlashWorker is a thin pass-through that
+    forwards forward_batch_generation straight to the target worker
+    (which produces a PPProxyTensors carrier the scheduler relays to
+    the next stage). All draft prep, draft forward, verify, and
+    spec_info bookkeeping happen on the last rank only.
+
+    The target's embed_tokens is replicated on the last rank by
+    Qwen3_5ForCausalLM (see qwen3_5: replicate embed_tokens patch), so
+    the per-block embed lookup stays local; no cross-rank lookup IPC
+    is required. Aux hidden states captured on earlier PP ranks are
+    threaded through the existing PPProxyTensors carrier.
+    """
 
     def __init__(
         self,
@@ -81,8 +96,68 @@ class DFlashWorker:
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
 
+        # PP topology: only the last PP rank owns the drafter + lm_head.
+        # The other ranks should never invoke draft/verify codepaths.
+        self.pp_group = get_pp_group()
+        self.is_drafter_rank = self.pp_group.is_last_rank
+
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+
+        if not self.is_drafter_rank:
+            # Skip drafter init entirely on non-last PP ranks. The DFlashWorker
+            # acts purely as a pass-through to target_worker so the PP scheduler
+            # loop can run unchanged: forward_batch_generation returns the
+            # target's PPProxyTensors carrier, which the scheduler relays to
+            # the next pipeline stage.
+            self.draft_worker = None
+            self.draft_model_runner = None
+            self.draft_model = None
+            self.block_size = (
+                int(server_args.speculative_num_draft_tokens)
+                if server_args.speculative_num_draft_tokens is not None
+                else 16
+            )
+            self.speculative_num_draft_tokens = int(self.block_size)
+            self._mask_token = None
+            self._mask_token_id_override = None
+            self._mask_token_id = -1
+            self._block_pos_offsets = torch.arange(
+                self.block_size, device=self.device, dtype=torch.int64
+            )
+            self._draft_block_ids_buf = None
+            self._draft_block_positions_buf = None
+            self._draft_block_tokens_buf = None
+            self._draft_verify_out_cache_loc_buf = None
+            self._draft_block_end_buf = None
+            self._draft_seq_lens_cpu_buf = None
+            self._draft_block_spec_info = DFlashVerifyInput(
+                draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
+                positions=torch.empty((0,), dtype=torch.int64, device=self.device),
+                draft_token_num=int(self.block_size),
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+            self._draft_greedy_gathered_max_buf = None
+            self._draft_greedy_gathered_ids_buf = None
+            self._draft_greedy_gather_cap = 0
+            self._draft_greedy_local_max_buf = None
+            self._draft_greedy_local_arg_buf = None
+            self._draft_greedy_local_cap = 0
+            self._draft_greedy_best_rank_buf = None
+            self._draft_greedy_rank_index_buf = None
+            self._draft_greedy_selected_ids_buf = None
+            self._draft_greedy_index_cap = 0
+            self._use_fused_kv_materialize = False
+            self._fused_kv_helper = None
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH PP rank %d/%d: drafter init skipped on non-last rank; "
+                    "this rank only forwards target slices.",
+                    self.pp_group.rank_in_group,
+                    self.pp_group.world_size,
+                )
+            return
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -1326,6 +1401,22 @@ class DFlashWorker:
         if getattr(batch, "return_logprob", False):
             raise RuntimeError(
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
+            )
+
+        if not self.is_drafter_rank:
+            # Non-last PP ranks: forward the target slice and let the
+            # scheduler relay the resulting PPProxyTensors to the next
+            # stage. We still enable aux capture in extend mode so the
+            # last rank receives the captured aux for layers local to
+            # this rank via the carrier.
+            if isinstance(batch, ModelWorkerBatch):
+                model_worker_batch = batch
+            else:
+                model_worker_batch = batch.get_model_worker_batch()
+                if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+                    model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            return self.target_worker.forward_batch_generation(
+                model_worker_batch, **kwargs
             )
 
         if isinstance(batch, ModelWorkerBatch):
