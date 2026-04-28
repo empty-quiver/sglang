@@ -1120,6 +1120,31 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
+    # Mirror Qwen3MoeForCausalLM's fused-name mapping. Without this, the
+    # compressed-tensors loader can't unfuse qkv_proj -> [q_proj, k_proj,
+    # v_proj] when checking the AWQ ignore list, so full-attention layers
+    # (which sglang fuses into qkv_proj) get treated as quantized even
+    # though the AWQ checkpoint marks q/k/v_proj as unquantized.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    # Override the inherited Qwen3VL mapper. The Qwen3VL parent rewrites
+    # checkpoint paths assuming layers live under `self.language_model.model.X`,
+    # but THIS class places them under `self.model.X` (with the inner
+    # `model.language_model` prefix string), so the AWQ `ignore` patterns
+    # like `model.language_model.layers.0.linear_attn.in_proj_a` already
+    # match the sglang-internal prefix verbatim and don't need rewriting.
+    # Without this override, the inherited mapper transforms the ignore
+    # list to `language_model.model.layers.0.linear_attn.in_proj_a` which
+    # no longer matches, so unquantized DeltaNet projections get treated
+    # as quantized; params_dict has `weight_packed`, the AWQ checkpoint
+    # provides `weight`, the load silently no-ops, and inference NaNs out.
+    hf_to_sglang_mapper = __import__(
+        "sglang.srt.models.utils", fromlist=["WeightsMapper"]
+    ).WeightsMapper()
+
     def __init__(
         self,
         config: Qwen3_5MoeConfig,
