@@ -644,6 +644,17 @@ class SchedulerPPMixin:
                         req.req_pool_idx, : len(req.fill_ids)
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
+                    # Patch: release Mamba state before req_pool to fix leak in
+                    # dynamic-chunking profile on hybrid Mamba/DeltaNet models.
+                    # Without this each profile iteration leaks a Mamba slot;
+                    # default pool of 17-19 slots fills around iteration 17 and
+                    # the next alloc raises Not enough space for mamba cache.
+                    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+                    if (
+                        isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+                        and getattr(req, "mamba_pool_idx", None) is not None
+                    ):
+                        self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
 
             logger.info(
