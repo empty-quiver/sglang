@@ -98,9 +98,28 @@ class SchedulerPPMixin:
                 # only exist after PP1's drafter step. Skip the chain.
                 dflash_pp_decode = self._pp_dflash_pp_decode_batch(self.cur_batch)
                 if self.cur_batch:
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} cur_batch_mode="
+                        f"{self.cur_batch.forward_mode.name} "
+                        f"dflash_pp_decode={dflash_pp_decode}",
+                        flush=True,
+                    )
                     server_is_idle = False
                     if not dflash_pp_decode:
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} about to _pp_recv_proxy_tensors()",
+                            flush=True,
+                        )
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} _pp_recv_proxy_tensors() DONE "
+                            f"keys="
+                            f"{list(pp_proxy_tensors.tensors.keys()) if pp_proxy_tensors else None}",
+                            flush=True,
+                        )
                     else:
                         pp_proxy_tensors = None
                 next_pp_outputs = None
@@ -115,11 +134,21 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if self.cur_batch:
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} about to _pp_launch_batch (run_batch)",
+                        flush=True,
+                    )
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
+                    )
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} _pp_launch_batch DONE",
+                        flush=True,
                     )
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -138,6 +167,12 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch and not dflash_pp_decode:
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} about to send_proxy keys="
+                            f"{list(result.pp_hidden_states_proxy_tensors.tensors.keys()) if result.pp_hidden_states_proxy_tensors else None}",
+                            flush=True,
+                        )
                         torch.cuda.current_stream().wait_event(self.launch_event)
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
@@ -146,6 +181,18 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                             )
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} send_proxy queued (async)",
+                            flush=True,
+                        )
+                    elif self.cur_batch and dflash_pp_decode:
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} dflash_pp_decode=True -> "
+                            f"skipping standard send_proxy_dict",
+                            flush=True,
+                        )
 
                 self.pp_outputs = next_pp_outputs
 

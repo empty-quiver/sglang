@@ -328,6 +328,13 @@ class DFlashDraftModel(nn.Module):
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
         expected = int(self.fc.in_features)
+        print(
+            f"[DFLASH-DEBUG project_target_hidden] target_hidden.shape="
+            f"{tuple(target_hidden.shape)} expected_last_dim={expected} "
+            f"num_context_features={self.num_context_features} "
+            f"hidden_size={int(self.config.hidden_size)}",
+            flush=True,
+        )
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "

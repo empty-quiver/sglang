@@ -38,6 +38,17 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def _dflash_dbg(rank: int, msg: str) -> None:
+    """Aggressive printf-style trace for the PP=2 DFLASH decode path.
+
+    Bypasses Python logging so a hung scheduler that swallows logger
+    output still shows progress (or lack thereof) on stdout. All lines
+    are tagged so they can be greped with `[DFLASH-DEBUG PP{rank}]`.
+    """
+    print(f"[DFLASH-DEBUG PP{rank}] {msg}", flush=True)
+
+
 _FusedKVMaterializeHelper = None
 
 
@@ -507,6 +518,13 @@ class DFlashWorker:
         commit_lens: torch.Tensor,
         committed_tokens: torch.Tensor,
     ) -> None:
+        rank = self.pp_group.rank_in_group
+        _dflash_dbg(
+            rank,
+            f"apply_follower_commit ENTER bs={batch.batch_size()} "
+            f"commit_lens.shape={tuple(commit_lens.shape)} "
+            f"committed_tokens.shape={tuple(committed_tokens.shape)}",
+        )
         from sglang.srt.speculative.dflash_info import _compute_paged_keep_slots
 
         bs = batch.batch_size()
@@ -566,6 +584,7 @@ class DFlashWorker:
                 torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
             )
         batch.seq_lens_sum += sum(commit_lens_cpu)
+        _dflash_dbg(rank, "apply_follower_commit EXIT")
 
     def _pp_dflash_follower_decode(
         self,
@@ -573,15 +592,26 @@ class DFlashWorker:
         **kwargs,
     ) -> "GenerationBatchResult":
         """PP0 follower routine for a DFLASH decode batch."""
+        rank = self.pp_group.rank_in_group
+        _dflash_dbg(rank, f"follower_decode ENTER bs={batch.batch_size()}")
         block_size = int(self.block_size)
         drafter_rank = self.pp_group.world_size - 1
 
         # 1) Receive verify candidates from PP1.
+        _dflash_dbg(
+            rank,
+            f"follower step=1/recv_candidates about to recv_tensor_dict src={drafter_rank}",
+        )
         cand = self.pp_group.recv_tensor_dict(src=drafter_rank)
+        _dflash_dbg(
+            rank,
+            f"follower step=1/recv_candidates DONE keys={list(cand.keys()) if cand else None}",
+        )
         if cand is None:
             raise RuntimeError("DFLASH PP follower got no candidate payload.")
 
         # 2) Local prepare_for_verify (allocator stays in lockstep with PP1).
+        _dflash_dbg(rank, "follower step=2/prepare_for_verify START")
         verify_input = DFlashVerifyInput(
             draft_token=cand["draft_token"],
             positions=cand["positions"],
@@ -599,40 +629,60 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+        _dflash_dbg(rank, "follower step=2/prepare_for_verify DONE")
 
         # 3) PP0-half target verify forward.
+        _dflash_dbg(rank, "follower step=3/target_fwd START")
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         target_kwargs = {k: v for k, v in kwargs.items() if k != "pp_proxy_tensors"}
         target_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **target_kwargs
         )
+        _dflash_dbg(rank, "follower step=3/target_fwd DONE")
 
         # 4) Send PP0-half hidden to PP1.
         if target_result.pp_hidden_states_proxy_tensors is None:
             raise RuntimeError(
                 "DFLASH PP follower target_worker returned no pp_hidden_states_proxy_tensors."
             )
+        _hidden_keys = list(target_result.pp_hidden_states_proxy_tensors.tensors.keys())
+        _dflash_dbg(
+            rank,
+            f"follower step=4/send_hidden about to send_tensor_dict dst={drafter_rank} keys={_hidden_keys}",
+        )
         self.pp_group.send_tensor_dict(
             target_result.pp_hidden_states_proxy_tensors.tensors,
             dst=drafter_rank,
         )
+        _dflash_dbg(rank, "follower step=4/send_hidden DONE")
 
         # 5) Receive commit and apply.
+        _dflash_dbg(
+            rank,
+            f"follower step=5/recv_commit about to recv_tensor_dict src={drafter_rank}",
+        )
         commit = self.pp_group.recv_tensor_dict(src=drafter_rank)
+        _dflash_dbg(
+            rank,
+            f"follower step=5/recv_commit DONE keys={list(commit.keys()) if commit else None}",
+        )
         if commit is None:
             raise RuntimeError("DFLASH PP follower got no commit payload.")
+        _dflash_dbg(rank, "follower step=6/apply_commit START")
         self._pp_apply_follower_commit(
             batch=batch,
             verify_input=verify_input,
             commit_lens=commit["commit_lens"],
             committed_tokens=commit["committed_tokens"],
         )
+        _dflash_dbg(rank, "follower step=6/apply_commit DONE")
         batch.forward_mode = ForwardMode.DECODE
         # The follower does not track per-req draft state; PP1 owns the
         # canonical DFlashDraftInput. Clear spec_info so the scheduler's
         # filter_batch path skips spec-side filtering on this rank.
         batch.spec_info = None
+        _dflash_dbg(rank, "follower_decode EXIT")
         return target_result
 
     def _gather_req_to_token_masked(
@@ -808,7 +858,17 @@ class DFlashWorker:
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput
     ):
+        rank = self.pp_group.rank_in_group
+        _dflash_dbg(
+            rank,
+            f"prepare_for_spec_decoding ENTER mode={batch.forward_mode.name} "
+            f"bs={batch.batch_size()}",
+        )
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
+            _dflash_dbg(
+                rank,
+                "prepare_for_spec_decoding EARLY RETURN (extend/idle)",
+            )
             return
 
         if batch.has_grammar:
@@ -985,6 +1045,11 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+        _dflash_dbg(
+            rank,
+            f"prepare_for_spec_decoding EXIT verify_input.draft_token.shape="
+            f"{tuple(verify_input.draft_token.shape)}",
+        )
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1210,6 +1275,15 @@ class DFlashWorker:
         bs = batch.batch_size()
         device = self.model_runner.device
 
+        rank = self.pp_group.rank_in_group
+        _dflash_dbg(
+            rank,
+            f"append_target_hidden_to_draft_kv ENTER bs={bs} "
+            f"target_hidden.shape="
+            f"{tuple(draft_input.target_hidden.shape) if draft_input.target_hidden is not None else None} "
+            f"ctx_lens.shape="
+            f"{tuple(draft_input.ctx_lens.shape) if draft_input.ctx_lens is not None else None}",
+        )
         if draft_input.target_hidden is None:
             raise RuntimeError(
                 "DFLASH draft state missing target_hidden context features."
@@ -1282,9 +1356,18 @@ class DFlashWorker:
             ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
 
         with torch.inference_mode():
+            _dflash_dbg(
+                rank,
+                "about to project_target_hidden draft_input.target_hidden.shape="
+                f"{tuple(draft_input.target_hidden.shape)}",
+            )
             ctx_hidden = self.draft_model.project_target_hidden(
                 draft_input.target_hidden
             )  # [sum(ctx), hidden]
+            _dflash_dbg(
+                rank,
+                f"project_target_hidden DONE ctx_hidden.shape={tuple(ctx_hidden.shape)}",
+            )
             if ctx_hidden.shape[0] != ctx_cache_loc.numel():
                 raise RuntimeError(
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
@@ -1606,6 +1689,17 @@ class DFlashWorker:
         batch: Union[ScheduleBatch, ModelWorkerBatch],
         **kwargs,
     ) -> GenerationBatchResult:
+        _rank = self.pp_group.rank_in_group
+        _mode = (
+            batch.forward_mode if isinstance(batch, ScheduleBatch) else None
+        )
+        _bs = (
+            batch.batch_size() if isinstance(batch, ScheduleBatch) else "?"
+        )
+        _dflash_dbg(
+            _rank,
+            f"fwd_batch_gen ENTER mode={_mode} bs={_bs} block_size={self.block_size}",
+        )
         if getattr(batch, "return_logprob", False):
             raise RuntimeError(
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
@@ -1626,22 +1720,33 @@ class DFlashWorker:
                 batch.forward_mode.is_decode() or batch.forward_mode.is_idle()
             ) and self.pp_group.world_size > 1:
                 if batch.forward_mode.is_idle():
+                    _dflash_dbg(
+                        _rank,
+                        "non-drafter idle path: delegating to target_worker",
+                    )
                     return self.target_worker.forward_batch_generation(
                         batch.get_model_worker_batch(), **kwargs
                     )
                 return self._pp_dflash_follower_decode(batch, **kwargs)
+            _dflash_dbg(
+                _rank,
+                f"non-drafter generic path mode={getattr(batch.forward_mode, 'name', '?') if hasattr(batch, 'forward_mode') else '?'}",
+            )
             if isinstance(batch, ModelWorkerBatch):
                 model_worker_batch = batch
             else:
                 model_worker_batch = batch.get_model_worker_batch()
                 if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
                     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            return self.target_worker.forward_batch_generation(
+            ret = self.target_worker.forward_batch_generation(
                 model_worker_batch, **kwargs
             )
+            _dflash_dbg(_rank, "non-drafter generic path EXIT")
+            return ret
 
         if isinstance(batch, ModelWorkerBatch):
             # Should not happen for spec-v1 (non-overlap) scheduling, but keep a sane fallback.
+            _dflash_dbg(_rank, "drafter rank fallback ModelWorkerBatch passthrough")
             return self.target_worker.forward_batch_generation(batch, **kwargs)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -1696,6 +1801,7 @@ class DFlashWorker:
             self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input
 
+            _dflash_dbg(_rank, "fwd_batch_gen EXIT (prefill drafter rank)")
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -1739,6 +1845,13 @@ class DFlashWorker:
         # as pp_proxy_tensors, then post-verify ship commit_lens to PP0.
         is_pp_decode = self.pp_group.world_size > 1
         if is_pp_decode:
+            _dflash_dbg(
+                _rank,
+                "drafter step=1/send_candidates about to send_tensor_dict "
+                f"dst=0 keys=['draft_token', 'positions'] "
+                f"draft_token.shape={tuple(verify_input.draft_token.shape)} "
+                f"positions.shape={tuple(verify_input.positions.shape)}",
+            )
             self.pp_group.send_tensor_dict(
                 {
                     "draft_token": verify_input.draft_token,
@@ -1746,7 +1859,16 @@ class DFlashWorker:
                 },
                 dst=0,
             )
+            _dflash_dbg(_rank, "drafter step=1/send_candidates DONE")
+            _dflash_dbg(
+                _rank, "drafter step=2/recv_hidden about to recv_tensor_dict src=0"
+            )
             pp0_proxy_dict = self.pp_group.recv_tensor_dict(src=0)
+            _dflash_dbg(
+                _rank,
+                "drafter step=2/recv_hidden DONE keys="
+                f"{list(pp0_proxy_dict.keys()) if pp0_proxy_dict else None}",
+            )
             if pp0_proxy_dict is None:
                 raise RuntimeError(
                     "DFLASH PP drafter got no verify-hidden payload from PP0."
@@ -1760,9 +1882,11 @@ class DFlashWorker:
             target_kwargs = kwargs
             pre_verify_output_lens = None
 
+        _dflash_dbg(_rank, "drafter step=3/target_verify_fwd START")
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **target_kwargs
         )
+        _dflash_dbg(_rank, "drafter step=3/target_verify_fwd DONE")
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -1802,6 +1926,12 @@ class DFlashWorker:
                     committed_tokens[i, :n] = torch.tensor(
                         new_tokens[:n], dtype=torch.int64, device=self.device
                     )
+            _dflash_dbg(
+                _rank,
+                "drafter step=5/send_commit about to send_tensor_dict "
+                f"dst=0 keys=['commit_lens', 'committed_tokens'] "
+                f"commit_lens={commit_lens.to('cpu').tolist()}",
+            )
             self.pp_group.send_tensor_dict(
                 {
                     "commit_lens": commit_lens.to(torch.int32),
@@ -1809,6 +1939,7 @@ class DFlashWorker:
                 },
                 dst=0,
             )
+            _dflash_dbg(_rank, "drafter step=5/send_commit DONE")
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
@@ -1827,6 +1958,10 @@ class DFlashWorker:
             )
             self._logged_first_verify = True
 
+        _dflash_dbg(
+            _rank,
+            f"fwd_batch_gen EXIT (decode) accept_length_per_req={accept_length_per_req_cpu}",
+        )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=new_verified_id,
