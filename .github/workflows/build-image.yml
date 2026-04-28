@@ -39,6 +39,14 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
 
+      - name: Add 8 GB swap (defense against nvcc OOM)
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: Checkout fork
         uses: actions/checkout@v4
         with:

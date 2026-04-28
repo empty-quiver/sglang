@@ -30,7 +30,7 @@ ENV UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH=/opt/venv/bin:/usr/local/cuda/bin:$PATH \
     PYTHONUNBUFFERED=1 \
-    TORCH_CUDA_ARCH_LIST="8.6;8.9" \
+    TORCH_CUDA_ARCH_LIST="8.9+PTX" \
     CUDA_HOME=/usr/local/cuda \
     CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
     MAX_JOBS=${MAX_JOBS} \
@@ -50,14 +50,6 @@ RUN uv pip install --no-cache --link-mode=copy \
 # Copy the entire fork into /src/sglang. The build context is the repo root
 # so this gets us sgl-kernel/, python/, etc.
 COPY . /src/sglang
-
-# Inject sm_86 gencode right after the sm_89 line so the build emits cubins
-# for both 4090 (sm_89) and 3060 (sm_86) MoE/Mamba/RMSNorm kernels. NOTE:
-# the source already has an sm_86 entry in the SGL_FLASH_KERNEL_CUDA_FLAGS
-# block lower in the file; we only target the SGL_KERNEL_CUDA_FLAGS block,
-# which is right after the sm_89 line that this sed-append-after matches.
-RUN sed -i '/"-gencode=arch=compute_89,code=sm_89"/a\        "-gencode=arch=compute_86,code=sm_86"' /src/sglang/sgl-kernel/CMakeLists.txt \
-    && grep -nE "gencode=arch=compute_8[69]" /src/sglang/sgl-kernel/CMakeLists.txt
 
 # Strip sgl-kernel down to just our targets (sm_86 + sm_89). Without this
 # the build emits SASS for sm_80, sm_89, sm_90, sm_90a, sm_100a, sm_120a,
@@ -121,10 +113,27 @@ RUN if grep -q "common_ops_sm90_build" /src/sglang/sgl-kernel/CMakeLists.txt; th
     fi
 RUN python3 -c "src = open('/src/sglang/sgl-kernel/CMakeLists.txt').read(); o=src.count('('); c=src.count(')'); print(f'paren balance: {o} open, {c} close, diff={o-c}'); assert o==c, 'CMakeLists.txt has unbalanced parens after sm90 strip'"
 
-# Build sgl-kernel wheel for sm_86+sm_89 from the in-tree source.
+# Add -fno-var-tracking-assignments + -g0 to nvcc host-side gcc flags.
+# Eliminates DWARF var-tracking memory bloat in template-heavy TUs (saves
+# ~15-20% per-TU peak on the GHA 16 GB runner).
+RUN python3 - <<'PY'
+import pathlib
+p = pathlib.Path("/src/sglang/sgl-kernel/CMakeLists.txt")
+src = p.read_text()
+target = '"-Xcompiler=-Wfatal-errors"'
+addition = '"-Xcompiler=-Wfatal-errors"\n    "-Xcompiler=-fno-var-tracking-assignments"\n    "-Xcompiler=-g0"'
+n = src.count(target)
+assert n >= 1, f"target not found"
+src = src.replace(target, addition, 1)
+p.write_text(src)
+print(f"added -fno-var-tracking-assignments + -g0")
+PY
+
+# Build sgl-kernel wheel for sm_89 (sm_86 via PTX JIT) from the in-tree source.
 WORKDIR /src/sglang/sgl-kernel
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/root/.cache/uv \
+    CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1" \
     uv pip install --no-cache --no-deps --no-build-isolation -v .
 
 # Clone kt-kernel source from kvcache-ai/ktransformers, apply the
