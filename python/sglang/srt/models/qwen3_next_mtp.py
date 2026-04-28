@@ -25,8 +25,9 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -64,13 +65,16 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         self.model = Qwen3NextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -80,6 +84,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ):
         if input_embeds is None:
@@ -97,11 +102,15 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             positions,
             forward_batch,
             hidden_states,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return hidden_states
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
