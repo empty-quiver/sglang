@@ -566,6 +566,10 @@ class DFlashWorker:
             committed_tokens=commit["committed_tokens"],
         )
         batch.forward_mode = ForwardMode.DECODE
+        # The follower does not track per-req draft state; PP1 owns the
+        # canonical DFlashDraftInput. Clear spec_info so the scheduler's
+        # filter_batch path skips spec-side filtering on this rank.
+        batch.spec_info = None
         return target_result
 
     def _gather_req_to_token_masked(
