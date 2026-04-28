@@ -32,7 +32,6 @@ from sglang.srt.speculative.dflash_utils import (
     get_dflash_layer_types,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +117,8 @@ class DFlashAttention(nn.Module):
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
-        rope_theta, rope_scaling = get_rope_config(config)
+        rope_theta = getattr(config, "rope_theta", 10000.0)
+        rope_scaling = getattr(config, "rope_scaling", None)
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
