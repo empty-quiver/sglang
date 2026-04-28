@@ -379,10 +379,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
             # Convert ResponsesRequest to ChatCompletionRequest for processing
+            # Default thinking off when caller didn't ask for it (Codex 0.101 sends
+            # reasoning=null for unknown slugs; without this the model burns its
+            # entire response budget inside <think>...</think> blocks).
+            import os as _os
+            _force = _os.getenv("SGLANG_KT_FORCE_THINKING") == "1"
+            _eff = request.reasoning.effort if request.reasoning else None
+            _think_default = _force or (_eff in ("medium", "high"))
+            _ctk = {"enable_thinking": _think_default}
             chat_request = ChatCompletionRequest(
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                chat_template_kwargs=_ctk,
             )
 
             # Follow SGLang's _process_messages pattern
@@ -464,8 +473,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request, final_res["text"], tokenizer
             )
 
-            # Calculate usage from actual output
-            if hasattr(final_res, "meta_info"):
+            # Calculate usage from actual output. SimpleContext.last_output
+            # is the engine's dict with keys ("text", "meta_info", ...);
+            # the original hasattr() probes silently fall through on dicts
+            # because dict lookup uses __getitem__, not attribute access,
+            # which is why output_tokens=0 leaked through to streaming
+            # consumers like Codex CLI.
+            num_reasoning_tokens = 0
+            if isinstance(final_res, dict) and "meta_info" in final_res:
+                _mi = final_res["meta_info"] or {}
+                num_prompt_tokens = _mi.get("prompt_tokens", 0)
+                num_generated_tokens = _mi.get("completion_tokens", 0)
+                num_cached_tokens = _mi.get("cached_tokens", 0)
+            elif hasattr(final_res, "meta_info"):
                 num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
@@ -482,13 +502,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else 0
                 )
                 num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
-                num_reasoning_tokens = 0
             else:
                 # Final fallback
                 num_prompt_tokens = 0
                 num_generated_tokens = 0
                 num_cached_tokens = 0
-                num_reasoning_tokens = 0
 
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
@@ -624,7 +642,68 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append({"role": "user", "content": request.input})
         else:
             messages.extend(request.input)  # type: ignore
-        return messages
+
+        # NORMALIZE for Codex/Responses-API compat:
+        #  - drop non-message items (reasoning, tool calls, custom items)
+        #    that Codex echoes back on multi-turn; sglang chat layer doesn't
+        #    accept them as input messages.
+        #  - map "developer" role -> "system" (Codex 0.101+ uses developer).
+        #  - convert content items {type: input_text|output_text} -> text;
+        #    flatten single-text content lists to a plain string so the
+        #    chat template renders cleanly.
+        normalized_messages = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            # Skip non-chat input items (reasoning, function_call, etc).
+            # Real chat messages have a "role" field.
+            if "role" not in m:
+                # Some Codex inputs have type=reasoning/function_call without
+                # a role; we have no good way to render those, drop them.
+                continue
+            role = m.get("role")
+            if role == "developer":
+                m = {**m, "role": "system"}
+            content = m.get("content")
+            if isinstance(content, list):
+                only_text = []
+                normalized = []
+                for it in content:
+                    if isinstance(it, dict):
+                        t = it.get("type")
+                        if t in ("input_text", "output_text"):
+                            it = {**it, "type": "text"}
+                            only_text.append(it.get("text", ""))
+                        elif t == "text":
+                            only_text.append(it.get("text", ""))
+                        else:
+                            only_text = None
+                    normalized.append(it)
+                if only_text is not None and len(only_text) == len(content):
+                    m["content"] = "".join(only_text)
+                else:
+                    m["content"] = normalized
+            normalized_messages.append(m)
+
+        # MERGE: chat template requires a single system message at position 0.
+        # Codex sends multiple developer/system items; concatenate them into
+        # one system message at the start, then the rest of the conversation.
+        sys_chunks = []
+        rest = []
+        for m in normalized_messages:
+            if m.get("role") == "system":
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    c = "\n".join(
+                        it.get("text", "") for it in c if isinstance(it, dict)
+                    )
+                sys_chunks.append(str(c))
+            else:
+                rest.append(m)
+        if sys_chunks:
+            merged_sys = {"role": "system", "content": "\n\n".join(sys_chunks)}
+            return [merged_sys] + rest
+        return rest
 
     def _construct_input_messages_with_harmony(
         self,
@@ -1245,6 +1324,119 @@ class OpenAIServingResponses(OpenAIServingChat):
                 },
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
+
+        # Emit synthetic per-item events that Codex CLI needs to render output.
+        # The non-Harmony streaming path (Qwen et al) skips delta events, so
+        # without these Codex sees nothing despite the server returning content.
+        from sglang.srt.entrypoints.openai import protocol as _kt_proto
+        from uuid import uuid4 as _uuid4
+        _outputs = response_dict.get("output", []) or []
+        _final_output_index = current_output_index
+        for _msg in _outputs:
+            _final_output_index += 1
+            _msg_type = _msg.get("type", "message")
+            _msg_id = _msg.get("id") or f"msg_{_uuid4().hex}"
+
+            if _msg_type == "message":
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=_final_output_index,
+                        item=_msg,
+                    )
+                )
+                _content_parts = _msg.get("content", []) or []
+                for _ci, _part in enumerate(_content_parts):
+                    if _part.get("type") == "output_text":
+                        _text = _part.get("text", "")
+                        yield _send_event(
+                            openai_responses_types.ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                sequence_number=-1,
+                                output_index=_final_output_index,
+                                item_id=_msg_id,
+                                content_index=_ci,
+                                part=_part,
+                            )
+                        )
+                        if _text:
+                            yield _send_event(
+                                openai_responses_types.ResponseTextDeltaEvent(
+                                    type="response.output_text.delta",
+                                    sequence_number=-1,
+                                    output_index=_final_output_index,
+                                    item_id=_msg_id,
+                                    content_index=_ci,
+                                    delta=_text,
+                                    logprobs=[],
+                                )
+                            )
+                        yield _send_event(
+                            openai_responses_types.ResponseTextDoneEvent(
+                                type="response.output_text.done",
+                                sequence_number=-1,
+                                output_index=_final_output_index,
+                                item_id=_msg_id,
+                                content_index=_ci,
+                                text=_text,
+                                logprobs=[],
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseContentPartDoneEvent(
+                                type="response.content_part.done",
+                                sequence_number=-1,
+                                output_index=_final_output_index,
+                                item_id=_msg_id,
+                                content_index=_ci,
+                                part=_part,
+                            )
+                        )
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=_final_output_index,
+                        item=_msg,
+                    )
+                )
+            elif _msg_type == "function_call":
+                # function_call items: just announce + done; Codex parses
+                # arguments out of the item itself
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=_final_output_index,
+                        item=_msg,
+                    )
+                )
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=_final_output_index,
+                        item=_msg,
+                    )
+                )
+            elif _msg_type == "reasoning":
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=_final_output_index,
+                        item=_msg,
+                    )
+                )
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=_final_output_index,
+                        item=_msg,
+                    )
+                )
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
