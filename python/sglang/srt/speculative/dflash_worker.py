@@ -49,6 +49,22 @@ def _dflash_dbg(rank: int, msg: str) -> None:
     print(f"[DFLASH-DEBUG PP{rank}] {msg}", flush=True)
 
 
+# Magic sentinel key that DFLASH-only IPC payloads carry. The standard
+# scheduler PP output ring (`_pp_send_output_to_next_stage`) shares the
+# PP0<->PP1 NCCL channel with our DFlash IPC and ships
+# `{next_token_ids, ...}` dicts at line 153 of event_loop_pp; without a
+# marker, those stale sends collide with our `recv_tensor_dict` calls
+# inside DFlashWorker and we get a cross-channel `KeyError`. Recv
+# helpers below loop until they see this key, dropping any dict that
+# doesn't (which means a standard-chain payload showed up out of band).
+_DFLASH_MARKER_KEY = "_dflash_marker"
+
+
+def _dflash_make_marker_tensor(device: torch.device) -> torch.Tensor:
+    """A 1-element int32 tensor used as the magic sentinel value."""
+    return torch.ones((1,), dtype=torch.int32, device=device)
+
+
 _FusedKVMaterializeHelper = None
 
 
@@ -511,6 +527,77 @@ class DFlashWorker:
     # PP0 then mirrors verify()'s free/req_to_token/output_ids bookkeeping
     # so its allocator and req state stay in lockstep with PP1.
 
+    def _pp_dflash_send_with_marker(
+        self,
+        payload: dict,
+        dst: int,
+        step_name: str,
+    ) -> None:
+        """Send a DFlash IPC tensor dict with a magic marker so the
+        receiver can distinguish it from any standard scheduler-chain
+        sends that share the same NCCL channel.
+        """
+        rank = self.pp_group.rank_in_group
+        marked = {_DFLASH_MARKER_KEY: _dflash_make_marker_tensor(self.device)}
+        marked.update(payload)
+        _dflash_dbg(
+            rank,
+            f"send_with_marker step={step_name} dst={dst} keys={list(marked.keys())}",
+        )
+        self.pp_group.send_tensor_dict(marked, dst=dst)
+        _dflash_dbg(rank, f"send_with_marker step={step_name} DONE")
+
+    def _pp_dflash_recv_with_marker(
+        self,
+        src: int,
+        step_name: str,
+        max_drains: int = 8,
+    ) -> dict:
+        """Receive a DFlash IPC tensor dict, draining any stale standard-
+        scheduler-chain payloads that may have queued ahead of ours on
+        the shared PP0<->PP1 NCCL channel. Returns the first dict that
+        carries `_DFLASH_MARKER_KEY`; raises if the drain budget is
+        exhausted.
+
+        The drain budget is a safety net: in normal steady state we
+        expect 0 stale payloads (decoder ring is single-shot per iter)
+        but on the first decode iter after prefill PP0 may see a
+        `{next_token_ids}` from the prefill output ring before the real
+        candidate dict arrives.
+        """
+        rank = self.pp_group.rank_in_group
+        for attempt in range(max_drains):
+            _dflash_dbg(
+                rank,
+                f"recv_with_marker step={step_name} src={src} attempt={attempt}",
+            )
+            d = self.pp_group.recv_tensor_dict(src=src)
+            if d is None:
+                _dflash_dbg(
+                    rank,
+                    f"recv_with_marker step={step_name} got None payload "
+                    "(world_size==1?), continuing",
+                )
+                continue
+            if _DFLASH_MARKER_KEY in d:
+                _dflash_dbg(
+                    rank,
+                    f"recv_with_marker step={step_name} DONE "
+                    f"keys={list(d.keys())}",
+                )
+                d.pop(_DFLASH_MARKER_KEY, None)
+                return d
+            _dflash_dbg(
+                rank,
+                f"recv_with_marker step={step_name} drained stale dict "
+                f"keys={list(d.keys())}, retrying",
+            )
+        raise RuntimeError(
+            f"DFLASH PP IPC: {step_name} exhausted drain budget "
+            f"({max_drains}) without seeing {_DFLASH_MARKER_KEY!r}; "
+            "channel may be misaligned."
+        )
+
     def _pp_apply_follower_commit(
         self,
         batch: ScheduleBatch,
@@ -597,15 +684,10 @@ class DFlashWorker:
         block_size = int(self.block_size)
         drafter_rank = self.pp_group.world_size - 1
 
-        # 1) Receive verify candidates from PP1.
-        _dflash_dbg(
-            rank,
-            f"follower step=1/recv_candidates about to recv_tensor_dict src={drafter_rank}",
-        )
-        cand = self.pp_group.recv_tensor_dict(src=drafter_rank)
-        _dflash_dbg(
-            rank,
-            f"follower step=1/recv_candidates DONE keys={list(cand.keys()) if cand else None}",
+        # 1) Receive verify candidates from PP1 (drains stale standard-chain
+        #    payloads via the marker sentinel; see _pp_dflash_recv_with_marker).
+        cand = self._pp_dflash_recv_with_marker(
+            src=drafter_rank, step_name="follower/recv_candidates"
         )
         if cand is None:
             raise RuntimeError("DFLASH PP follower got no candidate payload.")
@@ -641,31 +723,20 @@ class DFlashWorker:
         )
         _dflash_dbg(rank, "follower step=3/target_fwd DONE")
 
-        # 4) Send PP0-half hidden to PP1.
+        # 4) Send PP0-half hidden to PP1 (with sentinel marker).
         if target_result.pp_hidden_states_proxy_tensors is None:
             raise RuntimeError(
                 "DFLASH PP follower target_worker returned no pp_hidden_states_proxy_tensors."
             )
-        _hidden_keys = list(target_result.pp_hidden_states_proxy_tensors.tensors.keys())
-        _dflash_dbg(
-            rank,
-            f"follower step=4/send_hidden about to send_tensor_dict dst={drafter_rank} keys={_hidden_keys}",
-        )
-        self.pp_group.send_tensor_dict(
-            target_result.pp_hidden_states_proxy_tensors.tensors,
+        self._pp_dflash_send_with_marker(
+            payload=target_result.pp_hidden_states_proxy_tensors.tensors,
             dst=drafter_rank,
+            step_name="follower/send_hidden",
         )
-        _dflash_dbg(rank, "follower step=4/send_hidden DONE")
 
-        # 5) Receive commit and apply.
-        _dflash_dbg(
-            rank,
-            f"follower step=5/recv_commit about to recv_tensor_dict src={drafter_rank}",
-        )
-        commit = self.pp_group.recv_tensor_dict(src=drafter_rank)
-        _dflash_dbg(
-            rank,
-            f"follower step=5/recv_commit DONE keys={list(commit.keys()) if commit else None}",
+        # 5) Receive commit and apply (drains stale standard-chain payloads).
+        commit = self._pp_dflash_recv_with_marker(
+            src=drafter_rank, step_name="follower/recv_commit"
         )
         if commit is None:
             raise RuntimeError("DFLASH PP follower got no commit payload.")
@@ -1845,29 +1916,16 @@ class DFlashWorker:
         # as pp_proxy_tensors, then post-verify ship commit_lens to PP0.
         is_pp_decode = self.pp_group.world_size > 1
         if is_pp_decode:
-            _dflash_dbg(
-                _rank,
-                "drafter step=1/send_candidates about to send_tensor_dict "
-                f"dst=0 keys=['draft_token', 'positions'] "
-                f"draft_token.shape={tuple(verify_input.draft_token.shape)} "
-                f"positions.shape={tuple(verify_input.positions.shape)}",
-            )
-            self.pp_group.send_tensor_dict(
-                {
+            self._pp_dflash_send_with_marker(
+                payload={
                     "draft_token": verify_input.draft_token,
                     "positions": verify_input.positions,
                 },
                 dst=0,
+                step_name="drafter/send_candidates",
             )
-            _dflash_dbg(_rank, "drafter step=1/send_candidates DONE")
-            _dflash_dbg(
-                _rank, "drafter step=2/recv_hidden about to recv_tensor_dict src=0"
-            )
-            pp0_proxy_dict = self.pp_group.recv_tensor_dict(src=0)
-            _dflash_dbg(
-                _rank,
-                "drafter step=2/recv_hidden DONE keys="
-                f"{list(pp0_proxy_dict.keys()) if pp0_proxy_dict else None}",
+            pp0_proxy_dict = self._pp_dflash_recv_with_marker(
+                src=0, step_name="drafter/recv_hidden"
             )
             if pp0_proxy_dict is None:
                 raise RuntimeError(
@@ -1926,20 +1984,14 @@ class DFlashWorker:
                     committed_tokens[i, :n] = torch.tensor(
                         new_tokens[:n], dtype=torch.int64, device=self.device
                     )
-            _dflash_dbg(
-                _rank,
-                "drafter step=5/send_commit about to send_tensor_dict "
-                f"dst=0 keys=['commit_lens', 'committed_tokens'] "
-                f"commit_lens={commit_lens.to('cpu').tolist()}",
-            )
-            self.pp_group.send_tensor_dict(
-                {
+            self._pp_dflash_send_with_marker(
+                payload={
                     "commit_lens": commit_lens.to(torch.int32),
                     "committed_tokens": committed_tokens,
                 },
                 dst=0,
+                step_name="drafter/send_commit",
             )
-            _dflash_dbg(_rank, "drafter step=5/send_commit DONE")
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
