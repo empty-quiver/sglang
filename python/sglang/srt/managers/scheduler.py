@@ -2375,11 +2375,17 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
+                # Without speculative decoding the runner consumes
+                # pp_proxy_tensors directly. With speculative decoding the
+                # spec worker either ignores pp_proxy_tensors (pp_size == 1)
+                # or, on the DFLASH PP path, relays it through the target
+                # worker on non-last ranks and consumes it on the last rank
+                # to assemble aux hidden states.
+                kwargs = {}
+                if self.spec_algorithm.is_none() or (
+                    self.spec_algorithm.is_dflash() and self.pp_size > 1
+                ):
+                    kwargs["pp_proxy_tensors"] = pp_proxy_tensors
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
