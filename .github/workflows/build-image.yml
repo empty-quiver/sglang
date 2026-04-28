@@ -40,11 +40,29 @@ jobs:
           df -h
 
       - name: Add 8 GB swap (defense against nvcc OOM)
+        # GHA ubuntu-latest already has /swapfile mounted and busy. Try a list
+        # of alternate paths and use the first one that's free; do not fail
+        # the build if all are taken (swap is defense-in-depth, not required).
         run: |
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          set +e
+          chosen=""
+          for path in /mnt/extra-swap /tmp/extra-swap /home/runner/extra-swap; do
+            if [ ! -e "$path" ]; then
+              if sudo fallocate -l 8G "$path" \
+                && sudo chmod 600 "$path" \
+                && sudo mkswap "$path" \
+                && sudo swapon "$path"; then
+                chosen="$path"
+                echo "Using swap path: $chosen"
+                break
+              else
+                sudo rm -f "$path"
+              fi
+            fi
+          done
+          if [ -z "$chosen" ]; then
+            echo "WARNING: could not add extra swap, continuing without"
+          fi
           free -h
 
       - name: Checkout fork
