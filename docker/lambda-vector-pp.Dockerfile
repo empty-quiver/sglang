@@ -177,13 +177,11 @@ ENV UV_LINK_MODE=copy \
 COPY --from=builder /opt/venv /opt/venv
 
 # Copy the fork's python/ directory so we can install our patched sglang-kt
-# in editable mode from local source. The build context is the fork root,
-# so this picks up everything under python/ at this commit's sha.
+# in editable mode from local source. The python/ subdirectory has its own
+# pyproject.toml (sglang-kt's) and is the install target. We do NOT need
+# to copy the repo-root files (no root pyproject.toml exists; sgl-kernel
+# is already built and installed in /opt/venv from stage 1).
 COPY --from=builder /src/sglang/python /opt/sglang/python
-COPY --from=builder /src/sglang/pyproject.toml /opt/sglang/
-# Some setup paths reference the in-tree sgl-kernel directory layout; copy
-# enough metadata for editable installs to work. We DON'T copy sgl-kernel/
-# itself since the wheel was already built and installed in stage 1.
 
 # Install sglang-kt from the local fork checkout WITHOUT deps so we don't
 # overwrite the sm_86+sm_89 sgl-kernel or our patched kt-kernel that we
