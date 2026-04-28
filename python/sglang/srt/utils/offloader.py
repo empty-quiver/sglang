@@ -141,7 +141,21 @@ class OffloaderV1(BaseOffloader):
                     k: v.to(device, non_blocking=True)
                     for k, v in module.state_dict().items()
                 }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                # `tie_weights=False` is required for models that legitimately
+                # share a parameter under multiple names (e.g. Qwen3-Next /
+                # Qwen3.5 linear-attention `dt_bias` is registered both as a
+                # plain parameter and as a tied alias). Without this kwarg
+                # `torch.func.functional_call` raises because the device_state
+                # dict contains the same tensor under two keys; the runtime
+                # check is overly strict for forward-only inference, where the
+                # tied alias is harmless.
+                output = functional_call(
+                    module,
+                    device_state,
+                    args=args,
+                    kwargs=kwargs,
+                    tie_weights=False,
+                )
                 module.forward = forward
                 return output
 
@@ -261,8 +275,16 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
 
     def forward(*args, **kwargs):
         module.forward = original_forward
+        # `tie_weights=False` mirrors the same fix in `_ModuleOffloader.forward`
+        # — needed for Qwen3-Next / Qwen3.5 linear-attention modules whose
+        # `dt_bias` parameter is registered under multiple names. See
+        # comment in OffloaderV1 for details.
         output = functional_call(
-            module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
+            module,
+            get_parameter_and_buffer_dicts(),
+            args=args,
+            kwargs=kwargs,
+            tie_weights=False,
         )
         on_forward_end()
         module.forward = forward
