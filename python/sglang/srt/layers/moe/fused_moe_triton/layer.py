@@ -265,7 +265,30 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
         server_args = get_global_server_args()
+        # PP gating: only attach kt-kernel for layers local to this rank,
+        # else rank 0 (3060) tries to allocate ~110 GB of CPU buffers for
+        # all 48 layers and OOMs.
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
+        if kt_config is not None:
+            try:
+                from sglang.srt.distributed import get_pp_group, get_pp_indices
+
+                _pg = get_pp_group()
+                if _pg.world_size > 1:
+                    _nlayers = (
+                        getattr(server_args, "_kt_num_layers", None)
+                        or kt_config.num_layers
+                    )
+                    if _nlayers:
+                        _start, _end = get_pp_indices(
+                            _nlayers,
+                            _pg.rank_in_group,
+                            _pg.world_size,
+                        )
+                        if not (_start <= layer_id < _end):
+                            kt_config = None
+            except Exception:
+                pass
         if kt_config is not None:
             if quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
