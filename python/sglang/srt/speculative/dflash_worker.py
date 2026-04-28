@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.server_args import (
     ServerArgs,
@@ -426,6 +427,146 @@ class DFlashWorker:
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
         pass
+
+    # DFLASH PP decode IPC. The standard scheduler proxy chain is bypassed
+    # for these batches (see scheduler_pp_mixin._pp_dflash_pp_decode_batch);
+    # the choreography per iteration is:
+    #   1. PP1 -> PP0  candidates (draft_token + positions).
+    #   2. PP0 -> PP1  PP0 half verify hidden (pp_proxy_tensors).
+    #   3. PP1 -> PP0  commit_lens + committed_tokens (post-sample).
+    # PP0 then mirrors verify()'s free/req_to_token/output_ids bookkeeping
+    # so its allocator and req state stay in lockstep with PP1.
+
+    def _pp_apply_follower_commit(
+        self,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        commit_lens: torch.Tensor,
+        committed_tokens: torch.Tensor,
+    ) -> None:
+        from sglang.srt.speculative.dflash_info import _compute_paged_keep_slots
+
+        bs = batch.batch_size()
+        device = batch.out_cache_loc.device
+        block_size = int(verify_input.draft_token_num)
+        commit_lens = commit_lens.to(device=device, dtype=torch.int32)
+        commit_lens_cpu = commit_lens.to("cpu").tolist()
+
+        out_cache_loc = batch.out_cache_loc.view(bs, block_size)
+        row_offsets = torch.arange(block_size, device=device)[None, :]
+        if self.page_size == 1:
+            keep_mask = row_offsets < commit_lens[:, None]
+            batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
+        else:
+            keep_slots = _compute_paged_keep_slots(
+                prefix_lens=batch.seq_lens,
+                commit_lens=commit_lens,
+                draft_token_num=block_size,
+                page_size=self.page_size,
+            )
+            batch.token_to_kv_pool_allocator.free(
+                out_cache_loc[row_offsets >= keep_slots[:, None]]
+            )
+            keep_mask = row_offsets < commit_lens[:, None]
+        batch.out_cache_loc = out_cache_loc[keep_mask]
+
+        if committed_tokens.device != device:
+            committed_tokens = committed_tokens.to(device, non_blocking=True)
+        committed_tokens_cpu = committed_tokens.to("cpu")
+        for i, req in enumerate(batch.reqs):
+            commit_len = int(commit_lens_cpu[i])
+            req.kv_committed_len += commit_len
+            req.kv_allocated_len = req.kv_committed_len
+            for j in range(commit_len):
+                token_id = int(committed_tokens_cpu[i, j].item())
+                req.output_ids.append(token_id)
+                req.check_finished()
+                if req.finished():
+                    break
+                if req.grammar is not None:
+                    req.grammar.accept_token(token_id)
+            req.spec_verify_ct += 1
+            req.spec_accepted_tokens += max(0, commit_len - 1)
+
+        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
+        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu.add_(
+                torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+            )
+        batch.seq_lens_sum += sum(commit_lens_cpu)
+
+    def _pp_dflash_follower_decode(
+        self,
+        batch: ScheduleBatch,
+        **kwargs,
+    ) -> "GenerationBatchResult":
+        """PP0 follower routine for a DFLASH decode batch."""
+        block_size = int(self.block_size)
+        drafter_rank = self.pp_group.world_size - 1
+
+        # 1) Receive verify candidates from PP1.
+        cand = self.pp_group.recv_tensor_dict(src=drafter_rank)
+        if cand is None:
+            raise RuntimeError("DFLASH PP follower got no candidate payload.")
+
+        # 2) Local prepare_for_verify (allocator stays in lockstep with PP1).
+        verify_input = DFlashVerifyInput(
+            draft_token=cand["draft_token"],
+            positions=cand["positions"],
+            draft_token_num=block_size,
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        verify_input.prepare_for_verify(
+            batch, self.page_size, build_custom_mask=False
+        )
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.spec_info = verify_input
+        batch.return_hidden_states = False
+
+        # 3) PP0-half target verify forward.
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        target_kwargs = {k: v for k, v in kwargs.items() if k != "pp_proxy_tensors"}
+        target_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True, **target_kwargs
+        )
+
+        # 4) Send PP0-half hidden to PP1.
+        if target_result.pp_hidden_states_proxy_tensors is None:
+            raise RuntimeError(
+                "DFLASH PP follower target_worker returned no pp_hidden_states_proxy_tensors."
+            )
+        self.pp_group.send_tensor_dict(
+            target_result.pp_hidden_states_proxy_tensors.tensors,
+            dst=drafter_rank,
+        )
+
+        # 5) Receive commit and apply.
+        commit = self.pp_group.recv_tensor_dict(src=drafter_rank)
+        if commit is None:
+            raise RuntimeError("DFLASH PP follower got no commit payload.")
+        self._pp_apply_follower_commit(
+            batch=batch,
+            verify_input=verify_input,
+            commit_lens=commit["commit_lens"],
+            committed_tokens=commit["committed_tokens"],
+        )
+        batch.forward_mode = ForwardMode.DECODE
+        return target_result
 
     def _gather_req_to_token_masked(
         self,
@@ -1404,11 +1545,24 @@ class DFlashWorker:
             )
 
         if not self.is_drafter_rank:
-            # Non-last PP ranks: forward the target slice and let the
-            # scheduler relay the resulting PPProxyTensors to the next
-            # stage. We still enable aux capture in extend mode so the
-            # last rank receives the captured aux for layers local to
-            # this rank via the carrier.
+            # Non-last PP ranks. Behavior depends on batch mode:
+            #   - extend / prefill: standard PP forward via the scheduler's
+            #     PPProxyTensors chain. Aux capture rides along in the
+            #     carrier so the last rank can build its draft state.
+            #   - decode: drive the cross-rank IPC dance ourselves. The
+            #     scheduler PP loop has skipped its standard recv/send
+            #     for these batches (see scheduler_pp_mixin patch); this
+            #     rank receives candidates from PP1, runs PP0's half of
+            #     target verify, sends hidden back, receives commit_lens,
+            #     and applies the post-verify state update.
+            if isinstance(batch, ScheduleBatch) and (
+                batch.forward_mode.is_decode() or batch.forward_mode.is_idle()
+            ) and self.pp_group.world_size > 1:
+                if batch.forward_mode.is_idle():
+                    return self.target_worker.forward_batch_generation(
+                        batch.get_model_worker_batch(), **kwargs
+                    )
+                return self._pp_dflash_follower_decode(batch, **kwargs)
             if isinstance(batch, ModelWorkerBatch):
                 model_worker_batch = batch
             else:
@@ -1504,8 +1658,34 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
+        # PP cross-rank choreography (decode mode): send candidates,
+        # recv PP0-half hidden, pass it through target_worker.fwd_batch_gen
+        # as pp_proxy_tensors, then post-verify ship commit_lens to PP0.
+        is_pp_decode = self.pp_group.world_size > 1
+        if is_pp_decode:
+            self.pp_group.send_tensor_dict(
+                {
+                    "draft_token": verify_input.draft_token,
+                    "positions": verify_input.positions,
+                },
+                dst=0,
+            )
+            pp0_proxy_dict = self.pp_group.recv_tensor_dict(src=0)
+            if pp0_proxy_dict is None:
+                raise RuntimeError(
+                    "DFLASH PP drafter got no verify-hidden payload from PP0."
+                )
+            target_kwargs = {
+                k: v for k, v in kwargs.items() if k != "pp_proxy_tensors"
+            }
+            target_kwargs["pp_proxy_tensors"] = PPProxyTensors(pp0_proxy_dict)
+            pre_verify_output_lens = [len(req.output_ids) for req in batch.reqs]
+        else:
+            target_kwargs = kwargs
+            pre_verify_output_lens = None
+
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
+            model_worker_batch, is_verify=True, **target_kwargs
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -1528,6 +1708,30 @@ class DFlashWorker:
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 commit_lens=commit_lens,
+            )
+
+        # PP commit phase: ship per-req commit_lens + accepted token ids
+        # to PP0 so it can mirror verify()'s free / req_to_token / output_ids
+        # bookkeeping and stay in lockstep with this rank.
+        if is_pp_decode:
+            bs_pp = batch.batch_size()
+            block_size = int(self.block_size)
+            committed_tokens = torch.zeros(
+                (bs_pp, block_size), dtype=torch.int64, device=self.device
+            )
+            for i, req in enumerate(batch.reqs):
+                new_tokens = req.output_ids[pre_verify_output_lens[i] :]
+                n = min(len(new_tokens), block_size)
+                if n > 0:
+                    committed_tokens[i, :n] = torch.tensor(
+                        new_tokens[:n], dtype=torch.int64, device=self.device
+                    )
+            self.pp_group.send_tensor_dict(
+                {
+                    "commit_lens": commit_lens.to(torch.int32),
+                    "committed_tokens": committed_tokens,
+                },
+                dst=0,
             )
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
