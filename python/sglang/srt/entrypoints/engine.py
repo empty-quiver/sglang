@@ -1011,10 +1011,39 @@ def _launch_scheduler_processes(
                 )
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:
+                    # Heterogeneous PP: allow per-PP-rank model paths via
+                    # SGLANG_RANK_MODEL_PATHS="0=/path/awq,1=/path/fp8".
+                    # Used to put Marlin-int4 weights on the 3060 (sm_86,
+                    # which can't run FP8 MoE GEMMs) and FP8 on the 4090.
+                    _rank_overrides_env = os.getenv("SGLANG_RANK_MODEL_PATHS", "")
+                    _rank_model_path = None
+                    if _rank_overrides_env:
+                        for _kv in _rank_overrides_env.split(","):
+                            if "=" in _kv:
+                                _k, _v = _kv.split("=", 1)
+                                if _k.strip() == str(pp_rank):
+                                    _rank_model_path = _v.strip()
+                                    break
+                    if _rank_model_path is not None:
+                        import copy as _copy_mod
+                        _rank_server_args = _copy_mod.deepcopy(server_args)
+                        _rank_server_args.model_path = _rank_model_path
+                        _rank_server_args.tokenizer_path = _rank_model_path
+                        # Per-rank ModelConfig must be re-derived from the
+                        # rank's own model_path. Drop any cached one.
+                        if hasattr(_rank_server_args, "model_config"):
+                            _rank_server_args.model_config = None
+                        logger.info(
+                            "PP rank %d: overriding model_path -> %s",
+                            pp_rank, _rank_model_path,
+                        )
+                        _passed_server_args = _rank_server_args
+                    else:
+                        _passed_server_args = server_args
                     proc = mp.Process(
                         target=run_scheduler_process_func,
                         args=(
-                            server_args,
+                            _passed_server_args,
                             port_args,
                             gpu_id,
                             tp_rank,
