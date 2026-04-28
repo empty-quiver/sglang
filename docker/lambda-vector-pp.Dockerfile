@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=ghcr.io/astral-sh/uv:0.8.0 /uv /uvx /usr/local/bin/
 
+ARG MAX_JOBS=12
+
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
@@ -30,8 +32,8 @@ ENV UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
     TORCH_CUDA_ARCH_LIST="8.6;8.9" \
     CUDA_HOME=/usr/local/cuda \
-    CMAKE_BUILD_PARALLEL_LEVEL=12 \
-    MAX_JOBS=12 \
+    CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
+    MAX_JOBS=${MAX_JOBS} \
     CCACHE_DIR=/root/.ccache \
     CMAKE_POLICY_VERSION_MINIMUM=3.5
 

@@ -83,6 +83,8 @@ jobs:
           tags: |
             ${{ steps.tags.outputs.sha_tag }}
             ${{ steps.tags.outputs.branch_tag }}
+          build-args: |
+            MAX_JOBS=2
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # The Dockerfile already pins TORCH_CUDA_ARCH_LIST="8.6;8.9", so
