@@ -22,6 +22,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.marlin_utils import (
+    GPTQ_MARLIN_MIN_THREAD_K,
+    GPTQ_MARLIN_MIN_THREAD_N,
     MarlinLinearLayerConfig,
     apply_gptq_marlin_linear,
     check_marlin_supports_shape,
@@ -217,12 +219,46 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
-        check_marlin_supports_shape(
-            c.partition_weight_shape[1],  # out_features
-            c.partition_weight_shape[0],  # in_features
-            c.full_weight_shape[0],  # in_features
+        # Marlin requires the partitioned out_features (size_n) be a multiple of
+        # GPTQ_MARLIN_MIN_THREAD_N (=64) and partitioned in_features (size_k) a
+        # multiple of GPTQ_MARLIN_MIN_THREAD_K (=128). Some checkpoints (e.g.
+        # Qwen3.5 / Qwen3-Next compressed-tensors W4A16 builds) contain narrow
+        # projections inside the linear-attention block whose out_features is 48
+        # — these violate the size_n constraint and crash the gptq_marlin_repack
+        # CUDA kernel deep inside `process_weights_after_loading` with a generic
+        # `size_n = 48 is not divisible by tile_n_size = 64` runtime check that
+        # gives no hint of *which* projection is at fault.
+        #
+        # The previous code called `check_marlin_supports_shape` but discarded
+        # its return value, so the underlying CUDA assertion was the only signal
+        # users got. Promote that check into a fail-fast Python error that names
+        # the layer, the violating dim, and points at the workaround so users
+        # can switch to a GPTQ-Int4 checkpoint or use a non-Marlin AWQ build.
+        size_n = c.partition_weight_shape[1]
+        size_k = c.partition_weight_shape[0]
+        marlin_ok, marlin_err = check_marlin_supports_shape(
+            size_n,  # out_features
+            size_k,  # in_features
+            c.full_weight_shape[0],  # in_features (full)
             c.group_size,
         )
+        if not marlin_ok:
+            layer_name = getattr(layer, "_sglang_layer_name", None) or getattr(
+                layer, "prefix", None
+            ) or type(layer).__name__
+            raise RuntimeError(
+                "compressed-tensors W4A16 Marlin repack is not supported for "
+                f"layer '{layer_name}' with shape "
+                f"(size_k={size_k}, size_n={size_n}, group_size={c.group_size}): "
+                f"{marlin_err}\n"
+                f"Marlin requires size_n % {GPTQ_MARLIN_MIN_THREAD_N} == 0 and "
+                f"size_k % {GPTQ_MARLIN_MIN_THREAD_K} == 0. This typically "
+                "happens on Qwen3.5 / Qwen3-Next AWQ checkpoints where narrow "
+                "linear-attention projections (e.g. 48-wide) are not Marlin-"
+                "tileable. Workarounds: use a GPTQ-Int4 build of the model, or "
+                "an AWQ build that goes through the standard AWQ kernel path "
+                "(non compressed-tensors)."
+            )
 
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)

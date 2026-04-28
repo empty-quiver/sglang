@@ -172,6 +172,14 @@ class CompressedTensorsConfig(QuantizationConfig):
             if scheme is None:
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
+            # Stash the fully-qualified layer name on the layer so downstream
+            # scheme code (e.g. CompressedTensorsWNA16's Marlin shape check)
+            # can produce error messages that name the actual projection
+            # (`model.layers.X.linear_attn.dt_proj`) rather than just the
+            # generic class name (`ColumnParallelLinear`). Bare
+            # ColumnParallelLinear / QKVParallelLinear do not store
+            # `self.prefix` themselves; only Merged*/RowParallelLinear do.
+            layer._sglang_layer_name = prefix
             return CompressedTensorsLinearMethod(self)
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
