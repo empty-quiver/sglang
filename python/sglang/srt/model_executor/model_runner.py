@@ -1729,6 +1729,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.attn_backend = self._get_attention_backend()
 
+    def _apply_pp_rank_attention_backend_override(self) -> None:
+        """Apply per-PP-rank overrides for the attention backend env vars.
+
+        On heterogeneous Pipeline Parallel deployments different PP ranks
+        sit on different SM compute capabilities and therefore have
+        different optimal attention kernels. For example, a 4090 (sm_89)
+        host running fa3 alongside a 3060 (sm_86) host that has to stay on
+        triton because fa3 requires sm_89+ for its fp8 read path.
+
+        ``--attention-backend`` / ``--prefill-attention-backend`` /
+        ``--decode-attention-backend`` are scalar server args, so without
+        a per-rank override every PP rank gets the same kernel. Allow
+        ``SGLANG_PP{pp_rank}_ATTENTION_BACKEND`` (and the prefill/decode
+        variants) to override the corresponding ``server_args`` field
+        on this rank only. Set means "use this on this rank"; unset means
+        "fall through to the global flag".
+        """
+        for env_suffix, attr in (
+            ("ATTENTION_BACKEND", "attention_backend"),
+            ("PREFILL_ATTENTION_BACKEND", "prefill_attention_backend"),
+            ("DECODE_ATTENTION_BACKEND", "decode_attention_backend"),
+        ):
+            env_name = f"SGLANG_PP{self.pp_rank}_{env_suffix}"
+            override = os.environ.get(env_name)
+            if override:
+                logger.info(
+                    f"Overriding server_args.{attr} on pp_rank={self.pp_rank} "
+                    f"to {override!r} from ${env_name}."
+                )
+                setattr(self.server_args, attr, override)
+
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
         draft_attn_backend = self.server_args.speculative_draft_attention_backend
@@ -1740,6 +1771,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 draft_attn_backend,
                 init_new_workspace=init_new_workspace,
             )
+
+        self._apply_pp_rank_attention_backend_override()
 
         self.prefill_attention_backend_str, self.decode_attention_backend_str = (
             self.server_args.get_attention_backends()
