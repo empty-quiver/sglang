@@ -27,7 +27,11 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 
@@ -1140,6 +1144,20 @@ class SchedulerPPMixin:
                 commit_lens=commit_lens,
                 committed_tokens=committed_tokens,
             )
+
+            # Mirror PP1's `batch.forward_mode = ForwardMode.DECODE` reset
+            # (dflash_worker.py:1855) so the next iter's get_next_batch_to_run
+            # does not see this batch as still-extend. With TARGET_VERIFY left
+            # in place, last_batch.forward_mode.is_extend() is True; combined
+            # with running_mbs[mb_id] === last_mbs[mb_id] (the same decode
+            # ScheduleBatch object after the prior iter's TARGET_VERIFY hop)
+            # the scheduler runs `running.merge_batch(last)` against itself,
+            # which torch.cats every batch field on top of itself and silently
+            # doubles bs. PP1's identical reset means PP1 stays at the real
+            # bs while PP0 grows; the proxy chain then ships PP0's bs=2 hidden
+            # states into PP1's bs=1 verify, blowing up at set_kv_buffer with
+            # the kt-kernel TVM "expected 2 got 1" mismatch the user sees.
+            batch.forward_mode = ForwardMode.DECODE
 
         bs = batch.batch_size()
         zero32 = torch.zeros((bs,), dtype=torch.int32, device=batch.device)
