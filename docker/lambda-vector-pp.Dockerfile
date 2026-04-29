@@ -47,9 +47,9 @@ RUN uv pip install --no-cache --link-mode=copy \
     ninja wheel setuptools packaging \
     "scikit-build-core>=0.10" pybind11 cmake cython numpy
 
-# Copy the entire fork into /src/sglang. The build context is the repo root
-# so this gets us sgl-kernel/, python/, etc.
-COPY . /src/sglang
+# Keep the expensive native-kernel layer independent from ordinary Python
+# source edits. Only changes under sgl-kernel/ should invalidate this build.
+COPY sgl-kernel /src/sglang/sgl-kernel
 
 # Strip sgl-kernel down to just our targets (sm_86 + sm_89). Without this
 # the build emits SASS for sm_80, sm_89, sm_90, sm_90a, sm_100a, sm_120a,
@@ -196,9 +196,9 @@ COPY --from=builder /opt/venv /opt/venv
 # Copy the fork's python/ directory so we can install our patched sglang-kt
 # in editable mode from local source. The python/ subdirectory has its own
 # pyproject.toml (sglang-kt's) and is the install target. We do NOT need
-# to copy the repo-root files (no root pyproject.toml exists; sgl-kernel
-# is already built and installed in /opt/venv from stage 1).
-COPY --from=builder /src/sglang/python /opt/sglang/python
+# to copy the repo-root files. Copy directly from the build context so Python
+# edits only invalidate the lightweight runtime install layers.
+COPY python /opt/sglang/python
 
 # Install sglang-kt from the local fork checkout WITHOUT deps so we don't
 # overwrite the sm_86+sm_89 sgl-kernel or our patched kt-kernel that we
