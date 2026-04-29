@@ -30,7 +30,7 @@ ENV UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH=/opt/venv/bin:/usr/local/cuda/bin:$PATH \
     PYTHONUNBUFFERED=1 \
-    TORCH_CUDA_ARCH_LIST="8.9+PTX" \
+    TORCH_CUDA_ARCH_LIST="8.6;8.9" \
     CUDA_HOME=/usr/local/cuda \
     CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
     MAX_JOBS=${MAX_JOBS} \
@@ -69,6 +69,12 @@ RUN sed -i \
         -e '/"-gencode=arch=compute_101a,code=sm_101a"/d' \
         /src/sglang/sgl-kernel/CMakeLists.txt
 RUN grep -n -E "gencode|SGL_KERNEL_CUDA_FLAGS\s*$" /src/sglang/sgl-kernel/CMakeLists.txt | head -10
+# Inject sm_86 gencode after the sm_89 line so cubins are emitted for the
+# 3060 (sm_86) too. The 4-core GHA runner OOMs at ~5 layers of sgl-kernel
+# templates compiling for both arches; the Vector has 16 cores + 192 GB,
+# so memory isn't a constraint here.
+RUN sed -i '/"-gencode=arch=compute_89,code=sm_89"/a\        "-gencode=arch=compute_86,code=sm_86"' /src/sglang/sgl-kernel/CMakeLists.txt
+
 
 # Drop the common_ops_sm90_build target entirely. We have no Hopper, and the
 # load_utils.py loader picks the sm100 directory for everything not sm_90.
