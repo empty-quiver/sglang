@@ -62,6 +62,50 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _ensure_flashinfer_swa_prefix_lens_fallback() -> None:
+    """Backport upstream's None-fallback for SWA prefill prefix_lens.
+
+    ``init_forward_metadata`` hardcodes ``prefix_lens=None`` on the
+    TARGET_VERIFY path. Upstream sglang ``9dba02506 "draft swa layer
+    support"`` added a fallback in ``update_sliding_window`` (read
+    ``spec_info.accept_length`` else fall back to ``seq_lens``); without
+    it the drafter's SWA verify crashes with ``Tensor - None``. The fork
+    carries the fix in source but the deployed image was built earlier
+    and does not bind-mount flashinfer_backend.py, so we re-apply at
+    import time. Idempotent; the wrapper just guards the original.
+    """
+    from sglang.srt.layers.attention.flashinfer_backend import (
+        FlashInferIndicesUpdaterPrefill,
+    )
+
+    if getattr(FlashInferIndicesUpdaterPrefill, "_dflash_swa_prefix_patched", False):
+        return
+    _orig = FlashInferIndicesUpdaterPrefill.update_sliding_window
+
+    def _patched(self, req_pool_indices, seq_lens, seq_lens_cpu, seq_lens_sum,
+                 prefix_lens, *args, **kwargs):
+        if prefix_lens is None:
+            spec_info = kwargs.get("spec_info")
+            if spec_info is None and len(args) >= 4:
+                spec_info = args[3]
+            accept_length = getattr(spec_info, "accept_length", None)
+            prefix_lens = (
+                seq_lens
+                if accept_length is None
+                else seq_lens - accept_length[: seq_lens.shape[0]].to(
+                    device=seq_lens.device, dtype=seq_lens.dtype
+                )
+            )
+        return _orig(self, req_pool_indices, seq_lens, seq_lens_cpu,
+                     seq_lens_sum, prefix_lens, *args, **kwargs)
+
+    FlashInferIndicesUpdaterPrefill.update_sliding_window = _patched
+    FlashInferIndicesUpdaterPrefill._dflash_swa_prefix_patched = True
+
+
+_ensure_flashinfer_swa_prefix_lens_fallback()
+
+
 class DFlashWorker:
     """DFlash speculative decoding worker (spec-v1, tp>=1, pp>=1).
 
