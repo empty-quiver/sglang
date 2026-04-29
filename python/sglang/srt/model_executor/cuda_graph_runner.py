@@ -1136,7 +1136,14 @@ class CudaGraphRunner:
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # PP proxy tensors are token-major. Speculative verify captures can
+            # have multiple tokens per request, so trim by token count rather
+            # than padded request batch size.
+            return PPProxyTensors(
+                {
+                    k: v[: self.raw_num_token] for k, v in output.tensors.items()
+                }
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
