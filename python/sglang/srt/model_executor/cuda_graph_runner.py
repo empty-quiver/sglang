@@ -161,9 +161,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # Size by max_num_token, not max_bs: with spec algorithms
+                # num_tokens_per_bs > 1 (DFlash uses 8), so the per-rank
+                # hidden_states tensor sent across PP has max_bs *
+                # num_tokens_per_bs rows. Sizing this buffer to max_bs
+                # alone makes downstream layers see only 2 of the 8 verify
+                # tokens on PP>0, which corrupts attention shapes and
+                # crashes Mamba's TARGET_VERIFY view-reshape.
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hidden_size), dtype=dtype),
+                    "residual": torch.zeros((max_num_token, hidden_size), dtype=dtype),
                 }
             else:
                 pp_proxy_tensors = None
