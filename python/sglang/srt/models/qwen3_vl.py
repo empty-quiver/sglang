@@ -1323,6 +1323,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # into the PPProxyTensors carrier returned by the inner model.
             return hidden_states
 
+    def pp_aux_in_count(self) -> int:
+        """Forward to inner Qwen3_5Model so cuda_graph_runner can size buffers."""
+        if hasattr(self.model, 'pp_aux_in_count'):
+            return self.model.pp_aux_in_count()
+        return 0
+
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if layer_ids is None:
             raise ValueError(

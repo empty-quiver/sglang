@@ -133,6 +133,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        pp_aux_in_count: int = 0,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -172,6 +173,15 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     "hidden_states": torch.zeros((max_num_token, hidden_size), dtype=dtype),
                     "residual": torch.zeros((max_num_token, hidden_size), dtype=dtype),
                 }
+                # DFLASH PP aux: allocate input buffers for aux features arriving
+                # via the PP proxy chain from earlier ranks. Without these, the
+                # captured cuda graph has no node to read PP{r-1}'s aux on
+                # replay and silently drops them — the drafter then sees fewer
+                # context features than num_target_layers and ValueErrors.
+                for i in range(pp_aux_in_count):
+                    pp_proxy_tensors[f"aux_hidden_states_{i}"] = torch.zeros(
+                        (max_num_token, hidden_size), dtype=dtype
+                    )
             else:
                 pp_proxy_tensors = None
 
@@ -553,6 +563,7 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            pp_aux_in_count=self._compute_pp_aux_in_count(),
         )
         self.buffers.share_buffers()
 
@@ -572,6 +583,20 @@ class CudaGraphRunner:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+
+    def _compute_pp_aux_in_count(self) -> int:
+        """DFlash aux features arriving via PP proxy from earlier ranks."""
+        if self.pp_size <= 1:
+            return 0
+        if not getattr(self.model_runner, 'dflash_use_aux_hidden_state', False):
+            return 0
+        model = self.model_runner.model
+        if hasattr(model, 'pp_aux_in_count'):
+            try:
+                return int(model.pp_aux_in_count())
+            except Exception:
+                return 0
+        return 0
 
     def _cache_loc_dtype(self):
         return torch.int64

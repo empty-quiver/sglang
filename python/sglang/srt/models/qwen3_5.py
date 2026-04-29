@@ -748,6 +748,13 @@ class Qwen3_5ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def pp_aux_in_count(self) -> int:
+        """Number of DFlash aux features arriving via PP proxy from earlier ranks."""
+        return sum(
+            1 for lid in (self.layers_to_capture or [])
+            if lid < self.start_layer
+        )
+
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
         # Only stamp the capture flag on PP-local layers. PPMissingLayer
