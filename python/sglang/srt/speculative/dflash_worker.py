@@ -841,7 +841,18 @@ class DFlashWorker:
             block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
 
-            noise_embedding = embed_module(block_ids)
+            # Memory-saver: when the replicated embed_tokens lives on CPU
+            # (DFlash + PP=2 mem-efficient mode), do the lookup on CPU and
+            # transfer the small result to GPU. block_ids is bs*block_size
+            # ints; result is bs*block_size*hidden_size bf16 (~80 KB at
+            # bs=1, block_size=8). PCIe round-trip is ~50 microseconds —
+            # negligible vs the 2.5 GB freed on PP1.
+            embed_weight = getattr(embed_module, 'weight', None)
+            if embed_weight is not None and embed_weight.device.type == 'cpu':
+                block_ids_cpu = block_ids.to('cpu', non_blocking=False)
+                noise_embedding = embed_module(block_ids_cpu).to(self.device, non_blocking=True)
+            else:
+                noise_embedding = embed_module(block_ids)
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
             # For spec-v1, the draft KV cache is always materialized before drafting the

@@ -708,6 +708,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
             )
+            if replicate_embed_for_dflash and not self.pp_group.is_first_rank:
+                self.embed_tokens = self.embed_tokens.cpu()
         else:
             self.embed_tokens = PPMissingLayer()
 
