@@ -323,12 +323,15 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # Cache intermediate SSM states per draft token during target verify.
+                # These buffers are indexed by compact request position, not by
+                # persistent Mamba slot, so they do not need the dummy +1 slot.
+                intermediate_spec_state_size = max(1, spec_state_size)
+                # Shape: [num_layers, spec_state_size, speculative_num_draft_tokens, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
-                        spec_state_size + 1,
+                        intermediate_spec_state_size,
                         speculative_num_draft_tokens,
                         temporal_state_shape[0],
                         temporal_state_shape[1],
@@ -337,13 +340,13 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
+                # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify.
+                # Shape: [num_layers, spec_state_size, speculative_num_draft_tokens, dim, K-1]
                 intermediate_conv_window_cache = [
                     torch.zeros(
                         size=(
                             num_mamba_layers,
-                            spec_state_size + 1,
+                            intermediate_spec_state_size,
                             speculative_num_draft_tokens,
                             conv_shape[0],
                             conv_shape[1],

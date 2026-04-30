@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -418,12 +419,21 @@ class ModelRunnerKVCacheMixin:
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
-                logging.warning(
-                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
-                    f"{self.max_total_num_tokens}. "
-                    f"Use the profiled value instead."
-                )
-            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+                if os.getenv("SGLANG_ALLOW_MAX_TOTAL_TOKENS_OVERRIDE") == "1":
+                    logging.warning(
+                        f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                        f"{self.max_total_num_tokens}. Using requested value because "
+                        "SGLANG_ALLOW_MAX_TOTAL_TOKENS_OVERRIDE=1 is set."
+                    )
+                    self.max_total_num_tokens = max_total_tokens
+                else:
+                    logging.warning(
+                        f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                        f"{self.max_total_num_tokens}. "
+                        f"Use the profiled value instead."
+                    )
+            else:
+                self.max_total_num_tokens = max_total_tokens
 
         self.max_total_num_tokens = (
             self.max_total_num_tokens

@@ -18,6 +18,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -62,7 +63,9 @@ def _get_dflash_layer_attention_params(
 
 
 class DFlashAttention(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_tensor_model_parallel_world_size())
@@ -104,13 +107,15 @@ class DFlashAttention(nn.Module):
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             bias=attention_bias,
-            prefix="qkv_proj",
+            quant_config=quant_config,
+            prefix="qkv_proj" if not prefix else f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
             bias=attention_bias,
-            prefix="o_proj",
+            quant_config=quant_config,
+            prefix="o_proj" if not prefix else f"{prefix}.o_proj",
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -238,15 +243,26 @@ class DFlashMLP(nn.Module):
 
 
 class DFlashDecoderLayer(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.self_attn = DFlashAttention(config=config, layer_id=layer_id)
+        self.self_attn = DFlashAttention(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix="self_attn" if not prefix else f"{prefix}.self_attn",
+        )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = DFlashMLP(config=config)
+        self.mlp = DFlashMLP(
+            config=config,
+            quant_config=quant_config,
+            prefix="mlp" if not prefix else f"{prefix}.mlp",
+        )
 
     def forward(
         self,
@@ -296,7 +312,15 @@ class DFlashDraftModel(nn.Module):
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.layers = nn.ModuleList(
-            [DFlashDecoderLayer(config=config, layer_id=i) for i in range(num_layers)]
+            [
+                DFlashDecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    quant_config=quant_config,
+                    prefix=f"layers.{i}" if not prefix else f"{prefix}.layers.{i}",
+                )
+                for i in range(num_layers)
+            ]
         )
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -315,8 +339,12 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        self.fc = nn.Linear(
-            self.num_context_features * hidden_size, hidden_size, bias=False
+        self.fc = ReplicatedLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix="fc" if not prefix else f"{prefix}.fc",
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -327,7 +355,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.in_features)
+        expected = int(self.fc.input_size)
         print(
             f"[DFLASH-DEBUG project_target_hidden] target_hidden.shape="
             f"{tuple(target_hidden.shape)} expected_last_dim={expected} "
@@ -344,7 +372,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        return self.hidden_norm(self.fc(target_hidden))
+        projected, _ = self.fc(target_hidden)
+        return self.hidden_norm(projected)
 
     @torch.no_grad()
     def forward(
