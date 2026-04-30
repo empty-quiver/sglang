@@ -568,8 +568,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_num_layers = 1
         elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
             model_num_layers = 1
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
+        layer_owner = self.model
+        if not hasattr(layer_owner, "start_layer"):
+            for attr in ("model", "language_model"):
+                nested = getattr(layer_owner, attr, None)
+                if nested is not None and hasattr(nested, "start_layer"):
+                    layer_owner = nested
+                    break
+        self.start_layer = getattr(layer_owner, "start_layer", 0)
+        self.end_layer = getattr(layer_owner, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
 
         # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
