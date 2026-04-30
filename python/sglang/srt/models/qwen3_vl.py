@@ -1073,6 +1073,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.capture_aux_hidden_states = False
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
@@ -1277,6 +1278,35 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        # The inner LM may return (hidden_states, aux_hidden_states) when
+        # EAGLE3/DFLASH aux capture is enabled. Unpack here so the captured
+        # aux states reach the LogitsProcessor instead of being misread as
+        # a single hidden tensor.
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
+        # First-iter visibility for the DFLASH PP aux flow at the
+        # last-rank LogitsProcessor entry point. If capture_aux is True
+        # but inner returned bare hidden_states, this is the smoking gun.
+        if (
+            self.capture_aux_hidden_states
+            and self.pp_group.is_last_rank
+            and not getattr(self, "_dflash_outer_aux_logged", False)
+        ):
+            logger.info(
+                "DFLASH outer forward (last rank): capture_aux=%s "
+                "inner_returned_tuple=%s aux_count=%s",
+                self.capture_aux_hidden_states,
+                aux_hidden_states is not None,
+                (
+                    len(aux_hidden_states)
+                    if aux_hidden_states is not None
+                    else 0
+                ),
+            )
+            self._dflash_outer_aux_logged = True
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -1284,11 +1314,31 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     hidden_states,
                     self.lm_head,
                     forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
+            # On non-last ranks the aux capture (if any) was already folded
+            # into the PPProxyTensors carrier returned by the inner model.
             return hidden_states
+
+    def pp_aux_in_count(self) -> int:
+        """Forward to inner Qwen3_5Model so cuda_graph_runner can size buffers."""
+        if hasattr(self.model, 'pp_aux_in_count'):
+            return self.model.pp_aux_in_count()
+        return 0
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        # The inner model is responsible for filtering layer ids that fall
+        # outside the local PP slice. Run this on every PP rank so the rank
+        # holding each captured layer can actually flag it.
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

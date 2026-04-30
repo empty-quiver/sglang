@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -139,6 +141,22 @@ class ModelRunnerKVCacheMixin:
             num_layers = self.num_effective_layers
 
         cell_size = self.get_cell_size_per_token(num_layers)
+        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import (
+                scale_kv_cell_size_per_token_for_dflash,
+            )
+
+            draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
+            if (
+                draft_num_layers is not None
+                and int(draft_num_layers) > 0
+                and int(num_layers) > 0
+            ):
+                cell_size = scale_kv_cell_size_per_token_for_dflash(
+                    target_cell_size_per_token=cell_size,
+                    target_num_layers=int(num_layers),
+                    draft_num_layers=int(draft_num_layers),
+                )
 
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
@@ -148,10 +166,34 @@ class ModelRunnerKVCacheMixin:
 
         return int(rest_memory * (1 << 30)) // cell_size
 
+    def get_pp_local_mamba_cache_params(self: ModelRunner):
+        config = self.mambaish_config
+        assert config is not None
+
+        cache_params = config.mamba2_cache_params
+        local_layers = [
+            layer_id
+            for layer_id in cache_params.layers
+            if self.start_layer <= layer_id < self.end_layer
+        ]
+        if len(local_layers) == len(cache_params.layers):
+            return cache_params
+
+        logger.info(
+            "Use PP-local Mamba cache layers. start_layer=%s, end_layer=%s, "
+            "global_mamba_layers=%s, local_mamba_layers=%s",
+            self.start_layer,
+            self.end_layer,
+            len(cache_params.layers),
+            len(local_layers),
+        )
+        return replace(cache_params, layers=local_layers)
+
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
         server_args = self.server_args
         assert config is not None
+        mamba_cache_params = self.get_pp_local_mamba_cache_params()
 
         # reserve the memory for the intermediate mamba states used for spec dec
         if not self.spec_algorithm.is_none():
@@ -162,7 +204,7 @@ class ModelRunnerKVCacheMixin:
                 self.dp_size if server_args.enable_dp_attention else 1
             )
             mamba_state_intermediate_size = (
-                config.mamba2_cache_params.mamba_cache_per_req
+                mamba_cache_params.mamba_cache_per_req
                 * max_running_requests
                 * server_args.speculative_num_draft_tokens
             )
@@ -185,7 +227,7 @@ class ModelRunnerKVCacheMixin:
             )
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            assert mamba_cache_params.mamba_cache_per_req > 0
 
             # On heterogeneous Pipeline Parallel deployments (different GPUs per
             # PP rank, or asymmetric layer partitions) each rank sees a different
@@ -219,12 +261,12 @@ class ModelRunnerKVCacheMixin:
             # calculate the max_mamba_cache_size based on the given total mamba memory
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
-                // config.mamba2_cache_params.mamba_cache_per_req
+                // mamba_cache_params.mamba_cache_per_req
             )
 
         mamba_state_memory = (
             server_args.max_mamba_cache_size
-            * config.mamba2_cache_params.mamba_cache_per_req
+            * mamba_cache_params.mamba_cache_per_req
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
@@ -397,12 +439,21 @@ class ModelRunnerKVCacheMixin:
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
-                logging.warning(
-                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
-                    f"{self.max_total_num_tokens}. "
-                    f"Use the profiled value instead."
-                )
-            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+                if os.getenv("SGLANG_ALLOW_MAX_TOTAL_TOKENS_OVERRIDE") == "1":
+                    logging.warning(
+                        f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                        f"{self.max_total_num_tokens}. Using requested value because "
+                        "SGLANG_ALLOW_MAX_TOTAL_TOKENS_OVERRIDE=1 is set."
+                    )
+                    self.max_total_num_tokens = max_total_tokens
+                else:
+                    logging.warning(
+                        f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                        f"{self.max_total_num_tokens}. "
+                        f"Use the profiled value instead."
+                    )
+            else:
+                self.max_total_num_tokens = max_total_tokens
 
         self.max_total_num_tokens = (
             self.max_total_num_tokens
@@ -461,7 +512,7 @@ class ModelRunnerKVCacheMixin:
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=config.mamba2_cache_params,
+                        cache_params=self.get_pp_local_mamba_cache_params(),
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
@@ -485,7 +536,7 @@ class ModelRunnerKVCacheMixin:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
-                    cache_params=config.mamba2_cache_params,
+                    cache_params=self.get_pp_local_mamba_cache_params(),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )

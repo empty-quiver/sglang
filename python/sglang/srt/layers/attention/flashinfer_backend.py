@@ -24,7 +24,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
@@ -588,8 +588,22 @@ class FlashInferAttnBackend(AttentionBackend):
                     fast_decode_plan, decode_wrappers[i]
                 )
         elif forward_mode.is_target_verify():
+            # FlashInfer's prefill wrapper decides mask mode based on whether
+            # `custom_mask_buf` is initialized (not whether a custom mask is provided).
+            # DFlash relies on layer causal/window metadata instead of a custom mask.
+            use_custom_mask = (
+                spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
+            )
             prefill_wrappers = []
             for i in range(self.num_wrappers):
+                wrapper_kwargs = {}
+                if use_custom_mask:
+                    wrapper_kwargs = {
+                        "custom_mask_buf": self.cuda_graph_custom_mask,
+                        "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
+                    }
+
                 prefill_wrappers.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -600,8 +614,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
-                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        **wrapper_kwargs,
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -774,10 +787,14 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
+            causal = (
+                not layer.is_cross_attention
+                and layer.attn_type != AttentionType.ENCODER_ONLY
+            )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
+                causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
                 # - Sliding window could cut across item boundaries, breaking semantic coherence
@@ -829,11 +846,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
-                if not self.is_dllm_model:
-                    # TODO: design a better interface
-                    # For other models, use causal attention for the ragged part as previously
-                    causal = True
-
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -1207,7 +1219,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1223,7 +1235,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1232,6 +1244,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         if use_ragged:
+            assert prefix_lens is not None
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
             # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
@@ -1263,7 +1276,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1271,12 +1284,23 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
+        if prefix_lens is None:
+            accept_length = getattr(spec_info, "accept_length", None)
+            prefix_lens = (
+                seq_lens
+                if accept_length is None
+                else seq_lens
+                - accept_length[: seq_lens.shape[0]].to(
+                    device=seq_lens.device, dtype=seq_lens.dtype
+                )
+            )
+        window_size = seq_lens.new_tensor(self.sliding_window_size)
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # window attention use paged only
                 paged_kernel_lens = torch.minimum(
                     seq_lens,
-                    torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
+                    window_size + seq_lens - prefix_lens,
                 )
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
             else:
@@ -1312,7 +1336,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1356,7 +1380,7 @@ class FlashInferIndicesUpdaterPrefill:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         seq_lens: torch.Tensor,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         kv_start_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
@@ -1368,6 +1392,7 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(seq_lens)
         if spec_info is None:
+            assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1391,14 +1416,26 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = None
         else:
             assert isinstance(spec_info, SpecInput)
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        req_pool_indices,
+                        paged_kernel_lens,
+                        paged_kernel_lens_sum,
+                        self.req_to_token,
+                        kv_start_idx=kv_start_idx,
+                    )
                 )
-            )
+            else:
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        req_pool_indices,
+                        paged_kernel_lens,
+                        paged_kernel_lens_sum,
+                        self.req_to_token,
+                    )
+                )
+            bs_eff = bs
 
         # extend part
         if use_ragged:

@@ -66,6 +66,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
@@ -363,8 +364,15 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=kwargs.get(
+                    "captured_last_layer_outputs", None
+                ),
+            )
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -607,10 +615,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -671,14 +685,31 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
-        # Embedding layer
-        if self.pp_group.is_first_rank:
+        # Embedding layer.
+        #
+        # DFLASH speculative decoding needs the target's embedding table on
+        # the last PP rank (where the drafter and lm_head live) so the
+        # drafter can call target_model.get_input_embeddings(...) locally
+        # each draft step. When DFlash is active and pp_size > 1, we
+        # replicate embed_tokens on the last PP rank as well as the first.
+        # The cost is one vocab*hidden weight copy on the last rank
+        # (~2.5 GB BF16 for Qwen3.6-27B) in exchange for skipping a
+        # cross-rank embed-lookup IPC every draft block.
+        srv_args = get_global_server_args()
+        replicate_embed_for_dflash = (
+            getattr(srv_args, "speculative_algorithm", None) == "DFLASH"
+            and self.pp_group.world_size > 1
+            and self.pp_group.is_last_rank
+        )
+        if self.pp_group.is_first_rank or replicate_embed_for_dflash:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
             )
+            if replicate_embed_for_dflash and not self.pp_group.is_first_rank:
+                self.embed_tokens = self.embed_tokens.cpu()
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -712,8 +743,42 @@ class Qwen3_5ForCausalLM(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        self.layers_to_capture = []
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
+
+    def pp_aux_in_count(self) -> int:
+        """Number of DFlash aux features arriving via PP proxy from earlier ranks."""
+        return sum(
+            1 for lid in (self.layers_to_capture or [])
+            if lid < self.start_layer
+        )
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
+        self.layers_to_capture = layers_to_capture
+        # Only stamp the capture flag on PP-local layers. PPMissingLayer
+        # placeholders at out-of-range indices are torch.nn.Identity and
+        # never get invoked, but stamping them is also harmless. We restrict
+        # the stamp to local layers anyway so the post-init log is precise
+        # and so any future shared-instance gotchas are avoided.
+        for layer_id in self.layers_to_capture:
+            if self.start_layer <= layer_id < self.end_layer:
+                setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        local_capture_ids = [
+            lid
+            for lid in self.layers_to_capture
+            if self.start_layer <= lid < self.end_layer
+        ]
+        logger.info(
+            "DFLASH set_dflash_layers_to_capture: pp_rank=%d slice=[%d,%d) "
+            "all_ids=%s local_ids=%s",
+            self.pp_group.rank_in_group,
+            self.start_layer,
+            self.end_layer,
+            self.layers_to_capture,
+            local_capture_ids,
+        )
 
     @torch.no_grad()
     def forward(
@@ -737,6 +802,18 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # Pre-load aux hidden states captured on previous PP ranks (if any),
+        # so the captured layer order is preserved end-to-end.
+        # Tensors are stored as "aux_hidden_states_<idx>" in the carrier.
+        aux_hidden_states: list[torch.Tensor] = []
+        if pp_proxy_tensors is not None and not self.pp_group.is_first_rank:
+            idx = 0
+            while True:
+                key = f"aux_hidden_states_{idx}"
+                if key not in pp_proxy_tensors.tensors:
+                    break
+                aux_hidden_states.append(pp_proxy_tensors[key])
+                idx += 1
         # Pass through decoder layers (PP-local range only)
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -748,6 +825,11 @@ class Qwen3_5ForCausalLM(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     forward_batch=forward_batch,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states
+                        if getattr(layer, "_is_layer_to_capture", False)
+                        else None
+                    ),
                 )
 
             # Process deepstack embeddings if provided
@@ -763,12 +845,13 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            for idx, aux in enumerate(aux_hidden_states):
+                tensors[f"aux_hidden_states_{idx}"] = aux
+            return PPProxyTensors(tensors)
 
         # Apply final normalization
         if hidden_states.shape[0] != 0:
@@ -777,7 +860,25 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        # First-iter visibility for the DFLASH PP aux flow. Logs how many
+        # aux tensors this rank is about to hand back to the LogitsProcessor
+        # call site (5 expected for Lorbus 27B + z-lab DFlash drafter).
+        if not getattr(self, "_dflash_aux_logged", False):
+            logger.info(
+                "DFLASH aux at last-rank forward exit: pp_rank=%d slice=[%d,%d) "
+                "aux_count=%d aux_shapes=%s",
+                self.pp_group.rank_in_group,
+                self.start_layer,
+                self.end_layer,
+                len(aux_hidden_states),
+                [tuple(a.shape) for a in aux_hidden_states],
+            )
+            self._dflash_aux_logged = True
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

@@ -27,7 +27,11 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 
@@ -91,8 +95,25 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} cur_batch_mode="
+                        f"{self.cur_batch.forward_mode.name}",
+                        flush=True,
+                    )
                     server_is_idle = False
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} about to _pp_recv_proxy_tensors()",
+                        flush=True,
+                    )
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} _pp_recv_proxy_tensors() DONE keys="
+                        f"{list(pp_proxy_tensors.tensors.keys()) if pp_proxy_tensors else None}",
+                        flush=True,
+                    )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -105,11 +126,21 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if self.cur_batch:
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} about to _pp_launch_batch (run_batch)",
+                        flush=True,
+                    )
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
+                    )
+                    print(
+                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                        f"mb_id={mb_id} _pp_launch_batch DONE",
+                        flush=True,
                     )
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -136,6 +167,11 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                             )
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} send_proxy queued (async)",
+                            flush=True,
+                        )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -918,6 +954,30 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+
+        # DFLASH spec-v1 PP=2: piggyback the next iter's drafter candidates and
+        # this iter's verify-commit info onto the standard PP output ring.
+        #   - next_candidates / next_positions: PP1's drafter output for the
+        #     NEXT decode iter. PP0 attaches to running_batch.spec_info before
+        #     the next decode forward.
+        #   - commit_lens / committed_tokens: PP1's verify() result for THIS
+        #     iter. PP0 mirrors verify()'s side effects (output_ids extension,
+        #     KV slot free, seq_lens advance) via pp_apply_follower_commit.
+        if result.dflash_next_candidates is not None:
+            tensor_dict["dflash_next_candidates"] = result.dflash_next_candidates
+        if result.dflash_next_positions is not None:
+            tensor_dict["dflash_next_positions"] = result.dflash_next_positions
+        if result.dflash_commit_lens is not None:
+            tensor_dict["dflash_commit_lens"] = result.dflash_commit_lens
+        if result.dflash_committed_tokens is not None:
+            tensor_dict["dflash_committed_tokens"] = result.dflash_committed_tokens
+            # Pack accepted-length scalar so PP0's spec metrics stay accurate.
+            tensor_dict["dflash_num_accepted_tokens"] = torch.tensor(
+                int(result.num_accepted_tokens),
+                dtype=torch.int32,
+                device=result.dflash_committed_tokens.device,
+            )
+
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -978,6 +1038,36 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
         batch.output_ids = pp_outputs["next_token_ids"]
+
+        # DFLASH spec-v1 PP=2: pluck the next iter's drafter candidates and this
+        # iter's verify commit info off the output ring. PPProxyTensors's
+        # __getitem__ raises on missing keys, so look at the underlying dict.
+        # Two side effects on PP0:
+        #   - apply pp_apply_follower_commit so output_ids / seq_lens / KV free
+        #     mirror PP1's verify() this iter (uses batch.spec_info, the
+        #     prior-forward verify_input still attached).
+        #   - replace batch.spec_info with the persistent DFlashDraftInput
+        #     (verify-time spec_info is one-shot) and stash the next-iter
+        #     candidates on it for the upcoming decode forward.
+        proxy_dict = pp_outputs.tensors
+        dflash_next_candidates = proxy_dict.get("dflash_next_candidates", None)
+        dflash_next_positions = proxy_dict.get("dflash_next_positions", None)
+        dflash_commit_lens = proxy_dict.get("dflash_commit_lens", None)
+        dflash_committed_tokens = proxy_dict.get("dflash_committed_tokens", None)
+        dflash_num_accepted = proxy_dict.get("dflash_num_accepted_tokens", None)
+        if (
+            not batch.spec_algorithm.is_none()
+            and batch.spec_algorithm.is_dflash()
+            and not self.pp_group.is_last_rank
+        ):
+            self._pp_dflash_apply_follower_commit(
+                batch=batch,
+                commit_lens=dflash_commit_lens,
+                committed_tokens=dflash_committed_tokens,
+                next_candidates=dflash_next_candidates,
+                next_positions=dflash_next_positions,
+            )
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -985,8 +1075,104 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            num_accepted_tokens=(
+                int(dflash_num_accepted.item())
+                if dflash_num_accepted is not None
+                else 0
+            ),
+            dflash_next_candidates=dflash_next_candidates,
+            dflash_next_positions=dflash_next_positions,
+            dflash_commit_lens=dflash_commit_lens,
+            dflash_committed_tokens=dflash_committed_tokens,
         )
         return output_result
+
+    def _pp_dflash_apply_follower_commit(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        commit_lens: Optional[torch.Tensor],
+        committed_tokens: Optional[torch.Tensor],
+        next_candidates: Optional[torch.Tensor],
+        next_positions: Optional[torch.Tensor],
+    ) -> None:
+        """PP0-side hook for DFLASH spec-v1 PP=2.
+
+        Called from _pp_prep_batch_result on the non-last rank. For decode
+        iters, applies PP1's verify-commit (output_ids extension, KV free,
+        seq_lens advance) using the prior forward's verify_input still attached
+        to batch.spec_info. Always installs a fresh DFlashDraftInput carrying
+        the next iter's drafter candidates so the upcoming decode forward can
+        read them.
+
+        PP0 does not need verified_id / target_hidden / ctx_lens for local
+        computation (they're drafter-only state on PP1); we keep dummy zero
+        tensors so filter_batch / merge_batch don't crash if reqs finish or
+        new prefills arrive.
+        """
+        from sglang.srt.speculative.dflash_info import (
+            DFlashDraftInput,
+            DFlashVerifyInput,
+        )
+
+        if next_candidates is None:
+            # Nothing to do; PP1 didn't ship candidates this iter (idle batch?).
+            return
+
+        # Decode iters carry verify-commit; prefill iters (drafter-prime only)
+        # ship just the candidates.
+        if commit_lens is not None and committed_tokens is not None:
+            verify_input = batch.spec_info
+            if not isinstance(verify_input, DFlashVerifyInput):
+                raise RuntimeError(
+                    "DFLASH PP follower expected DFlashVerifyInput on batch.spec_info "
+                    f"after decode forward, got {type(verify_input).__name__}."
+                )
+            # DFlash spec worker is self.draft_worker (a DFlashWorker), aliased
+            # to self.model_worker by init_model_worker. Fall back to tp_worker
+            # only as a defensive last resort.
+            worker = getattr(self, "draft_worker", None) or getattr(
+                self, "model_worker", None
+            ) or self.tp_worker
+            if not hasattr(worker, "pp_apply_follower_commit"):
+                raise RuntimeError(
+                    "DFLASH PP follower could not locate pp_apply_follower_commit on "
+                    f"the spec worker (got {type(worker).__name__})."
+                )
+            worker.pp_apply_follower_commit(
+                batch=batch,
+                verify_input=verify_input,
+                commit_lens=commit_lens,
+                committed_tokens=committed_tokens,
+            )
+
+            # Mirror PP1's `batch.forward_mode = ForwardMode.DECODE` reset
+            # (dflash_worker.py:1855) so the next iter's get_next_batch_to_run
+            # does not see this batch as still-extend. With TARGET_VERIFY left
+            # in place, last_batch.forward_mode.is_extend() is True; combined
+            # with running_mbs[mb_id] === last_mbs[mb_id] (the same decode
+            # ScheduleBatch object after the prior iter's TARGET_VERIFY hop)
+            # the scheduler runs `running.merge_batch(last)` against itself,
+            # which torch.cats every batch field on top of itself and silently
+            # doubles bs. PP1's identical reset means PP1 stays at the real
+            # bs while PP0 grows; the proxy chain then ships PP0's bs=2 hidden
+            # states into PP1's bs=1 verify, blowing up at set_kv_buffer with
+            # the kt-kernel TVM "expected 2 got 1" mismatch the user sees.
+            batch.forward_mode = ForwardMode.DECODE
+
+        bs = batch.batch_size()
+        zero32 = torch.zeros((bs,), dtype=torch.int32, device=batch.device)
+        zero64 = torch.zeros((bs,), dtype=torch.int64, device=batch.device)
+        draft_input = DFlashDraftInput(
+            verified_id=zero64,
+            target_hidden=torch.empty(
+                (0,), dtype=torch.float32, device=batch.device
+            ),
+            ctx_lens=zero32,
+            draft_seq_lens=zero32.clone(),
+            next_candidates=next_candidates,
+            next_positions=next_positions,
+        )
+        batch.spec_info = draft_input
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult

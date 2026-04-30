@@ -780,5 +780,58 @@ class KimiK25ForConditionalGeneration(nn.Module):
             config.text_config
         )
 
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[List[int]] = None
+    ) -> None:
+        """Set the layers to capture for EAGLE3 speculative decoding."""
+        if not hasattr(self.language_model, "set_eagle3_layers_to_capture"):
+            raise AttributeError(
+                "language_model does not support EAGLE3 speculative decoding."
+            )
+
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
+        """Set the layers to capture for DFLASH draft model training."""
+        if not hasattr(self.language_model, "set_dflash_layers_to_capture"):
+            raise AttributeError(
+                "language_model does not support DFLASH layer capture."
+            )
+
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    def get_input_embeddings(self):
+        if not hasattr(self.language_model, "get_input_embeddings"):
+            raise AttributeError(
+                "language_model does not support get_input_embeddings()."
+            )
+
+        return self.language_model.get_input_embeddings()
+
+    @property
+    def lm_head(self):
+        if not hasattr(self.language_model, "lm_head"):
+            raise AttributeError("language_model does not expose lm_head.")
+
+        return self.language_model.lm_head
+
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get embedding and LM head weights for speculative decoding."""
+        if not hasattr(self.language_model, "get_embed_and_head"):
+            raise AttributeError(
+                "language_model does not support get_embed_and_head()."
+            )
+
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+        """Set embedding and LM head weights for speculative decoding."""
+        if not hasattr(self.language_model, "set_embed_and_head"):
+            raise AttributeError(
+                "language_model does not support set_embed_and_head()."
+            )
+
+        self.language_model.set_embed_and_head(embed, head)
+
 
 EntryClass = [KimiK25ForConditionalGeneration]

@@ -133,6 +133,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        pp_aux_in_count: int = 0,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -161,10 +162,26 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # Size by max_num_token, not max_bs: with spec algorithms
+                # num_tokens_per_bs > 1 (DFlash uses 8), so the per-rank
+                # hidden_states tensor sent across PP has max_bs *
+                # num_tokens_per_bs rows. Sizing this buffer to max_bs
+                # alone makes downstream layers see only 2 of the 8 verify
+                # tokens on PP>0, which corrupts attention shapes and
+                # crashes Mamba's TARGET_VERIFY view-reshape.
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hidden_size), dtype=dtype),
+                    "residual": torch.zeros((max_num_token, hidden_size), dtype=dtype),
                 }
+                # DFLASH PP aux: allocate input buffers for aux features arriving
+                # via the PP proxy chain from earlier ranks. Without these, the
+                # captured cuda graph has no node to read PP{r-1}'s aux on
+                # replay and silently drops them — the drafter then sees fewer
+                # context features than num_target_layers and ValueErrors.
+                for i in range(pp_aux_in_count):
+                    pp_proxy_tensors[f"aux_hidden_states_{i}"] = torch.zeros(
+                        (max_num_token, hidden_size), dtype=dtype
+                    )
             else:
                 pp_proxy_tensors = None
 
@@ -472,18 +489,15 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if (
-            model_runner.spec_algorithm.is_eagle()
-            or model_runner.spec_algorithm.is_standalone()
-            or model_runner.spec_algorithm.is_ngram()
-        ):
+        if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
-                raise RuntimeError("This should not happen")
-            else:
-                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
-                )
+                # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
+                if not self.model_runner.spec_algorithm.is_dflash():
+                    raise RuntimeError("This should not happen")
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.num_tokens_per_bs = (
+                self.model_runner.server_args.speculative_num_draft_tokens
+            )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -549,17 +563,11 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            pp_aux_in_count=self._compute_pp_aux_in_count(),
         )
         self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
-
-        # Speculative_inference
-        if (
-            model_runner.spec_algorithm.is_eagle3()
-            and model_runner.eagle_use_aux_hidden_state
-        ):
-            self.model_runner.model.set_eagle3_layers_to_capture()
 
         # Capture
         try:
@@ -576,6 +584,20 @@ class CudaGraphRunner:
             for attn_backend in self.model_runner.decode_attn_backend_group:
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
+    def _compute_pp_aux_in_count(self) -> int:
+        """DFlash aux features arriving via PP proxy from earlier ranks."""
+        if self.pp_size <= 1:
+            return 0
+        if not getattr(self.model_runner, 'dflash_use_aux_hidden_state', False):
+            return 0
+        model = self.model_runner.model
+        if hasattr(model, 'pp_aux_in_count'):
+            try:
+                return int(model.pp_aux_in_count())
+            except Exception:
+                return 0
+        return 0
+
     def _cache_loc_dtype(self):
         return torch.int64
 
@@ -585,6 +607,7 @@ class CudaGraphRunner:
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_dflash()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -912,6 +935,12 @@ class CudaGraphRunner:
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and "input_embeds" in inspect.signature(forward).parameters
+            ):
+                kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -988,6 +1017,7 @@ class CudaGraphRunner:
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_dflash()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1009,6 +1039,13 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if (
+            self.model_runner.spec_algorithm.is_dflash()
+            and self.model_runner.is_draft_worker
+            and forward_batch.input_embeds is not None
+        ):
+            buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
+            # Padded tokens aren't read, so skip zeroing them.
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -1054,6 +1091,14 @@ class CudaGraphRunner:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and forward_batch.input_embeds is not None
+            ):
+                self.buffers.input_embeds[: self.raw_num_token].copy_(
+                    forward_batch.input_embeds
+                )
 
         # Replay
         if self.enable_pdmux:
@@ -1066,10 +1111,18 @@ class CudaGraphRunner:
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
-                full_logits = output.full_logits[: self.raw_num_token]
+                full_logits = (
+                    output.full_logits[: self.raw_num_token]
+                    if output.full_logits is not None
+                    else None
+                )
             else:
                 full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                next_token_logits = (
+                    output.next_token_logits[: self.raw_num_token]
+                    if output.next_token_logits is not None
+                    else None
+                )
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
@@ -1083,7 +1136,14 @@ class CudaGraphRunner:
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # PP proxy tensors are token-major. Speculative verify captures can
+            # have multiple tokens per request, so trim by token count rather
+            # than padded request batch size.
+            return PPProxyTensors(
+                {
+                    k: v[: self.raw_num_token] for k, v in output.tensors.items()
+                }
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
@@ -1111,6 +1171,32 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+        elif self.model_runner.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+            from sglang.srt.speculative.dflash_utils import (
+                resolve_dflash_verify_mask_policy,
+            )
+
+            # Avoid enabling custom-mask modes during graph capture for backends that
+            # can express DFLASH verify via their built-in causal path.
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            spec_info = DFlashVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=(
+                    None
+                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    else self.buffers.custom_mask
+                ),
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
+            )
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput

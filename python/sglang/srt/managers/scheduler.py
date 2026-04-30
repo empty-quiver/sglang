@@ -246,6 +246,26 @@ class EmbeddingBatchResult:
         self.copy_done.record()
 
 
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if enable_overlap and req.return_hidden_states:
+        return "DFLASH speculative decoding does not support return_hidden_states yet."
+    if (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            "DFLASH speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
+
+    return None
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -1561,6 +1581,13 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.spec_algorithm.is_dflash():
+            error_msg = validate_dflash_request(req, self.enable_overlap)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
@@ -2003,7 +2030,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is not None
+            and self.chunked_req is None
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -2348,11 +2375,17 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
+                # Without speculative decoding the runner consumes
+                # pp_proxy_tensors directly. With speculative decoding the
+                # spec worker either ignores pp_proxy_tensors (pp_size == 1)
+                # or, on the DFLASH PP path, relays it through the target
+                # worker on non-last ranks and consumes it on the last rank
+                # to assemble aux hidden states.
+                kwargs = {}
+                if self.spec_algorithm.is_none() or (
+                    self.spec_algorithm.is_dflash() and self.pp_size > 1
+                ):
+                    kwargs["pp_proxy_tensors"] = pp_proxy_tensors
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
