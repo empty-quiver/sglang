@@ -1702,6 +1702,11 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if req.to_finish is not None or req.finished():
+            req.check_finished()
+            self.stream_output([req], req.return_logprob)
+            return
+
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
