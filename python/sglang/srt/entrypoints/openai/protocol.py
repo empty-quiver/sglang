@@ -1152,7 +1152,7 @@ class ResponsesRequest(BaseModel):
             ]
         ]
     ] = None
-    input: Union[str, List[ResponseInputOutputItem]]
+    input: Union[str, List[Any]]
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
@@ -1184,6 +1184,10 @@ class ResponsesRequest(BaseModel):
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
+    )
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Extra chat template kwargs used when Responses input is rendered through the chat template.",
     )
 
     # SGLang-specific sampling parameters
