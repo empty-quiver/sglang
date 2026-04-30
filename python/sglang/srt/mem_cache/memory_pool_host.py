@@ -18,6 +18,7 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
     KVCache,
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -1235,4 +1236,71 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
         self._backup_indexer_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
+        )
+
+
+class HybridLinearTokenToKVPoolHost:
+    """Host KV cache adapter for hybrid GDN/Mamba models.
+
+    HybridLinearKVPool stores only full-attention layers in its nested
+    full_kv_pool; the linear/GDN state lives in MambaPool and is managed by
+    MambaRadixCache. HiCache transfers should therefore operate on the nested
+    full-attention KV pool while preserving the outer pool used by the scheduler.
+    """
+
+    device_pool: HybridLinearKVPool
+
+    def __init__(
+        self,
+        device_pool: HybridLinearKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        self.device_pool = device_pool
+        host_cls = (
+            MLATokenToKVPoolHost if device_pool.use_mla else MHATokenToKVPoolHost
+        )
+        self.full_kv_pool_host = host_cls(
+            device_pool.full_kv_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.full_kv_pool_host, name)
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+    ):
+        self.full_kv_pool_host.load_to_device_per_layer(
+            device_pool.full_kv_pool,
+            host_indices,
+            device_indices,
+            layer_id,
+            io_backend,
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        self.full_kv_pool_host.backup_from_device_all_layer(
+            device_pool.full_kv_pool,
+            host_indices,
+            device_indices,
+            io_backend,
         )

@@ -1353,9 +1353,11 @@ class HybridLinearKVPool(KVCache):
         self.dtype = dtype
         self.device = device
         self.full_layer_nums = len(full_attention_layer_ids)
+        self.layer_num = self.full_layer_nums
         self.page_size = page_size
         # TODO support pp?
         self.start_layer = 0
+        self.end_layer = self.full_layer_nums - 1
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
@@ -1407,6 +1409,7 @@ class HybridLinearKVPool(KVCache):
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
+        self.store_dtype = self.full_kv_pool.store_dtype
         if use_mla:
             self.mem_usage = self.get_kv_size_bytes() / GB
         else:
@@ -1431,6 +1434,9 @@ class HybridLinearKVPool(KVCache):
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
+
+    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
+        self.full_kv_pool.register_layer_transfer_counter(layer_transfer_counter)
 
     def _transfer_full_attention_id(self, layer_id: int):
         if layer_id not in self.full_attention_layer_id_mapping:
