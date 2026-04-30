@@ -1791,6 +1791,16 @@ class ServerArgs:
                     )
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
+            elif (
+                self.speculative_algorithm == "DFLASH"
+                and envs.SGLANG_ENABLE_DFLASH_RADIX_CACHE.get()
+            ):
+                logger.warning(
+                    "Enabling radix cache with DFLASH speculative decoding for %s. "
+                    "This requires compact DFLASH draft-cache windowing so cached "
+                    "target prefixes have matching draft KV materialization.",
+                    model_arch,
+                )
             else:
                 logger.warning(
                     f"Disabling radix cache since speculative decoding for {model_arch} is not supported with radix cache yet."
@@ -2514,6 +2524,38 @@ class ServerArgs:
                         "--speculative-num-draft-tokens (block_size). "
                         f"window_size={window_size}, block_size={draft_tokens}."
                     )
+
+            if envs.SGLANG_ENABLE_DFLASH_RADIX_CACHE.get():
+                if self.speculative_dflash_draft_window_size is None:
+                    raise ValueError(
+                        "SGLANG_ENABLE_DFLASH_RADIX_CACHE requires "
+                        "--speculative-dflash-draft-window-size. DFLASH radix-cache "
+                        "reuse needs compact draft-cache windowing so target prefix "
+                        "hits do not require a full-length draft req-to-token table."
+                    )
+                if self.max_mamba_cache_size is not None:
+                    per_req_mamba_slots = 3
+                    effective_max_running_requests = (
+                        int(self.max_running_requests)
+                        if self.max_running_requests is not None
+                        else 48
+                    )
+                    local_max_running_requests = effective_max_running_requests // (
+                        self.dp_size if self.enable_dp_attention else 1
+                    )
+                    local_max_running_requests = max(local_max_running_requests, 1)
+                    min_mamba_cache_size = (
+                        per_req_mamba_slots * local_max_running_requests
+                    )
+                    if int(self.max_mamba_cache_size) < min_mamba_cache_size:
+                        raise ValueError(
+                            "SGLANG_ENABLE_DFLASH_RADIX_CACHE requires "
+                            f"--max-mamba-cache-size >= {min_mamba_cache_size} for "
+                            f"max_running_requests={effective_max_running_requests}. "
+                            "MambaRadixCache reserves three mamba slots per running "
+                            "request: active request state, radix cached state, and "
+                            "copy-on-write state for prefix hits."
+                        )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48

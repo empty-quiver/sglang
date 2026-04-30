@@ -415,6 +415,7 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    SGLANG_ENABLE_DFLASH_RADIX_CACHE = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
