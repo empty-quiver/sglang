@@ -147,7 +147,9 @@ RUN --mount=type=cache,target=/root/.ccache \
 # never merged upstream), then build kt-kernel for sm_86+sm_89.
 # --recurse-submodules pulls in third_party/pybind11 and third_party/llama.cpp
 # which kt-kernel/CMakeLists.txt needs as add_subdirectory targets.
-RUN git clone --depth 1 --recurse-submodules --shallow-submodules \
+ARG KTRANSFORMERS_CACHE_BUST=20260501-rawint4-avx2
+RUN echo "KTRANSFORMERS_CACHE_BUST=${KTRANSFORMERS_CACHE_BUST}" && \
+    git clone --depth 1 --recurse-submodules --shallow-submodules \
         https://github.com/kvcache-ai/ktransformers.git /src/ktransformers
 COPY docker/kt-kernel-numa-single-socket.patch /tmp/
 RUN cd /src/ktransformers && git apply -v /tmp/kt-kernel-numa-single-socket.patch \
@@ -199,6 +201,7 @@ COPY --from=builder /opt/venv /opt/venv
 # to copy the repo-root files. Copy directly from the build context so Python
 # edits only invalidate the lightweight runtime install layers.
 COPY python /opt/sglang/python
+COPY scripts /opt/sglang/scripts
 
 # Install sglang-kt from the local fork checkout WITHOUT deps so we don't
 # overwrite the sm_86+sm_89 sgl-kernel or our patched kt-kernel that we
