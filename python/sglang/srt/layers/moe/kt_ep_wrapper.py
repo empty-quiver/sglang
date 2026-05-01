@@ -204,6 +204,7 @@ class SharedFullContext:
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
             params_dtype=params_dtype,
+            weight_loader=self.gpu_layer.weight_loader,
         )
 
         # Detect quantization type for weight loading based on actually created weights.
@@ -260,6 +261,16 @@ class SharedFullContext:
     def _detect_quant_type_from_created_weights(self) -> None:
         """Detect quant type from weight attributes created on gpu_layer."""
         layer = self.gpu_layer
+        self.is_wna16_quant = False
+
+        # AutoRound/GPTQ/AWQ WNA16 MoE path. This layout uses qweight/scales
+        # directly instead of the compressed-tensors Marlin packed names.
+        if hasattr(layer, "w13_qweight") and hasattr(layer, "w2_qweight"):
+            self.is_wna16_quant = True
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
 
         # INT4 Marlin
         if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
@@ -402,7 +413,9 @@ class SharedFullContext:
     @property
     def weight_names(self) -> list:
         """Get weight names based on quantization type."""
-        if self.is_fp8_quant:
+        if getattr(self, "is_wna16_quant", False):
+            return self.WEIGHT_NAMES_WNA16
+        elif self.is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
         elif self.is_fp8_channel_quant:
             return self.WEIGHT_NAMES_FP8_CHANNEL
@@ -410,6 +423,14 @@ class SharedFullContext:
             return self.WEIGHT_NAMES_BF16
         else:
             return self.WEIGHT_NAMES_INT4
+
+    # Weight names for shared memory buffers (AutoRound/GPTQ/AWQ WNA16 format)
+    WEIGHT_NAMES_WNA16 = [
+        "w13_qweight",
+        "w13_scales",
+        "w2_qweight",
+        "w2_scales",
+    ]
 
     # Weight names for shared memory buffers (INT4 Marlin format)
     WEIGHT_NAMES_INT4 = [
@@ -468,9 +489,11 @@ class SharedFullContext:
             self.shm_unique_id = None
         if dist.is_initialized():
             unique_id_list = [self.shm_unique_id]
-            dist.broadcast_object_list(
-                unique_id_list, src=0, group=get_tp_group().cpu_group
-            )
+            _group = get_tp_group().cpu_group
+            # Under PP, each TP group may not contain global rank 0.
+            # PyTorch expects the source as a global rank in the group.
+            _src = dist.get_global_rank(_group, 0)
+            dist.broadcast_object_list(unique_id_list, src=_src, group=_group)
             self.shm_unique_id = unique_id_list[0]
 
         for name in self.weight_names:
@@ -1070,6 +1093,141 @@ class SharedFullContext:
 
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
+    def _prepare_weight_wna16(self, wrapper, original_layer=None, gpu_experts_mask=None,
+                              logical_to_gpu_index=None):
+        """Prepare AutoRound/GPTQ/AWQ WNA16 weights for full-GPU fallback.
+
+        WNA16 MoE weights are already in the qweight/scales layout consumed by
+        MoeWNA16Method.apply(), so unlike Marlin INT4 they do not need transpose
+        or repack postprocessing after staging from KT.
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+        num_cpus = os.cpu_count()
+        target_cpu = num_cpus - 1 - tp_rank
+        os.sched_setaffinity(0, {target_cpu})
+
+        layer = self.gpu_layer
+        num_experts = layer.num_experts
+        device = layer.w13_qweight.device
+
+        for optional_name in ("w13_qzeros", "w2_qzeros"):
+            optional = getattr(layer, optional_name, None)
+            if optional is not None and optional.numel() != 0:
+                raise NotImplementedError(
+                    "KT full-GPU WNA16 fallback only supports symmetric quantization "
+                    f"without zero-points; found non-empty {optional_name}"
+                )
+
+        weight_infos = []
+        for name in self.WEIGHT_NAMES_WNA16:
+            cpu_buf = self.cpu_buffers[name]
+            gpu_t = getattr(layer, name)
+            weight_infos.append((name, cpu_buf, gpu_t))
+
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+            for e in range(num_experts):
+                if gpu_experts_mask[e].item():
+                    gpu_expert_ids.append(e)
+                else:
+                    cpu_expert_ids.append(e)
+        else:
+            cpu_expert_ids = list(range(num_experts))
+
+        if gpu_expert_ids:
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+        if not cpu_expert_ids:
+            return
+
+        copy_stream = torch.cuda.Stream(device=device)
+        post_stream = torch.cuda.Stream(device=device)
+        events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
+
+        tp_world_size = get_tensor_model_parallel_world_size()
+        do_write = tp_rank == 0 and wrapper is not None
+
+        if do_write:
+            w13_weight_buf = self.cpu_buffers["w13_qweight"]
+            w13_scale_buf = self.cpu_buffers["w13_scales"]
+            w2_weight_buf = self.cpu_buffers["w2_qweight"]
+            w2_scale_buf = self.cpu_buffers["w2_scales"]
+
+            w13_weight_expert_nbytes = (
+                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+            )
+            w13_scale_expert_nbytes = (
+                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+            )
+            w2_weight_expert_nbytes = (
+                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+            )
+            w2_scale_expert_nbytes = (
+                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+            )
+
+            def submit_write_expert(expert_id, slot):
+                w13_weight_ptrs = [
+                    ptr + slot * w13_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_qweight"]
+                ]
+                w13_scale_ptrs = [
+                    ptr + slot * w13_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_scales"]
+                ]
+                w2_weight_ptrs = [
+                    ptr + slot * w2_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_qweight"]
+                ]
+                w2_scale_ptrs = [
+                    ptr + slot * w2_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_scales"]
+                ]
+                wrapper.submit_write_weight_scale_to_buffer(
+                    tp_world_size,
+                    expert_id,
+                    w13_weight_ptrs,
+                    w13_scale_ptrs,
+                    w2_weight_ptrs,
+                    w2_scale_ptrs,
+                )
+
+            submit_write_expert(cpu_expert_ids[0], 0)
+
+        for idx, e in enumerate(cpu_expert_ids):
+            slot = idx % 2
+
+            if do_write:
+                wrapper.sync_write_weight_scale_to_buffer()
+                if idx + 1 < len(cpu_expert_ids):
+                    next_slot = (idx + 1) % 2
+                    if idx > 0:
+                        events[idx - 1].synchronize()
+                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            with torch.cuda.stream(copy_stream):
+                for _, cpu_buf, gpu_t in weight_infos:
+                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                events[idx].record(copy_stream)
+
+            if idx > 0:
+                with torch.cuda.stream(post_stream):
+                    post_stream.wait_event(events[idx - 1])
+
+        if cpu_expert_ids:
+            with torch.cuda.stream(post_stream):
+                post_stream.wait_event(events[-1])
+
+        torch.cuda.current_stream(device).wait_stream(post_stream)
+
     def _prepare_weight_bf16(self, wrapper, original_layer=None, gpu_experts_mask=None,
                              logical_to_gpu_index=None):
         """Prepare BF16/unquantized weights by writing from KT and copying to GPU.
@@ -1245,8 +1403,11 @@ class SharedFullContext:
         t0 = time.perf_counter()
 
         # Select appropriate prepare_weight method based on quantization type
-        # FP8/BF16 methods support GPU expert optimization; INT4 uses full CPU pipeline
-        if self.is_fp8_quant:
+        # FP8/BF16/WNA16 methods support GPU expert optimization; INT4 uses full CPU pipeline
+        if getattr(self, "is_wna16_quant", False):
+            self._prepare_weight_wna16(wrapper, original_layer, gpu_experts_mask,
+                                       logical_to_gpu_index)
+        elif self.is_fp8_quant:
             self._prepare_weight_fp8(wrapper, original_layer, gpu_experts_mask,
                                      logical_to_gpu_index)
         elif self.is_fp8_channel_quant:
@@ -1776,6 +1937,36 @@ def select_top_experts_from_batch(
     return selected_experts
 
 
+def copy_experts_weights_wna16(
+    src_layer: torch.nn.Module,
+    dst_layer: torch.nn.Module,
+    selected_experts: torch.Tensor,
+) -> None:
+    """Copy AutoRound/GPTQ/AWQ WNA16 expert weights into resident GPU slots."""
+    weight_names = ["w13_qweight", "w13_scales", "w2_qweight", "w2_scales"]
+    for optional_name in ("w13_qzeros", "w2_qzeros"):
+        src_optional = getattr(src_layer, optional_name, None)
+        dst_optional = getattr(dst_layer, optional_name, None)
+        if (
+            src_optional is not None
+            and dst_optional is not None
+            and src_optional.numel() != 0
+            and dst_optional.numel() != 0
+        ):
+            weight_names.append(optional_name)
+
+    logical_to_dst_index = {
+        int(selected_experts[i].item()): i
+        for i in range(len(selected_experts))
+    }
+
+    for weight_name in weight_names:
+        src_weight = getattr(src_layer, weight_name)
+        dst_weight = getattr(dst_layer, weight_name)
+        for logical_id, dst_idx in logical_to_dst_index.items():
+            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+
+
 def copy_experts_weights_int4(
     src_layer: torch.nn.Module,
     dst_layer: torch.nn.Module,
@@ -2045,6 +2236,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.logical_to_gpu_index_cuda = None
 
         self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
+        if (
+            self.gpu_prefill_token_threshold > 0
+            and (kt_config.method or "").upper() == "GPTQ_INT4"
+        ):
+            logger.warning(
+                "Disabling KT layerwise full-GPU prefill and dynamic expert update "
+                "for layer %d: kt-kernel GPTQ_INT4 does not implement "
+                "write_weight_scale_to_buffer.",
+                kt_config.layer_idx,
+            )
+            self.gpu_prefill_token_threshold = 0
+            kt_config.kt_enable_dynamic_expert_update = False
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
 
@@ -2487,10 +2690,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Broadcast selected experts to all ranks for consistent weight updates
         if dist.is_initialized():
-            dist.broadcast(selected_experts, src=0, group=get_tp_group().device_group)
+            _group = get_tp_group().device_group
+            _src = dist.get_global_rank(_group, 0)
+            dist.broadcast(selected_experts, src=_src, group=_group)
 
         # Step 2: Copy weights from temporary layer to original layer
-        if ctx.is_fp8_quant:
+        if getattr(ctx, "is_wna16_quant", False):
+            copy_experts_weights_wna16(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+            )
+        elif ctx.is_fp8_quant:
             copy_experts_weights_fp8(
                 src_layer=ctx.gpu_layer,
                 dst_layer=layer,
