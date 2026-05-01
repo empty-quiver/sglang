@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -95,25 +96,33 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
-                    print(
-                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
-                        f"mb_id={mb_id} cur_batch_mode="
-                        f"{self.cur_batch.forward_mode.name}",
-                        flush=True,
+                    dflash_debug = os.getenv("SGLANG_DFLASH_DEBUG") in (
+                        "1",
+                        "true",
+                        "TRUE",
                     )
+                    if dflash_debug:
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} cur_batch_mode="
+                            f"{self.cur_batch.forward_mode.name}",
+                            flush=True,
+                        )
                     server_is_idle = False
-                    print(
-                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
-                        f"mb_id={mb_id} about to _pp_recv_proxy_tensors()",
-                        flush=True,
-                    )
+                    if dflash_debug:
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} about to _pp_recv_proxy_tensors()",
+                            flush=True,
+                        )
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                    print(
-                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
-                        f"mb_id={mb_id} _pp_recv_proxy_tensors() DONE keys="
-                        f"{list(pp_proxy_tensors.tensors.keys()) if pp_proxy_tensors else None}",
-                        flush=True,
-                    )
+                    if dflash_debug:
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} _pp_recv_proxy_tensors() DONE keys="
+                            f"{list(pp_proxy_tensors.tensors.keys()) if pp_proxy_tensors else None}",
+                            flush=True,
+                        )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -126,22 +135,24 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if self.cur_batch:
-                    print(
-                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
-                        f"mb_id={mb_id} about to _pp_launch_batch (run_batch)",
-                        flush=True,
-                    )
+                    if dflash_debug:
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} about to _pp_launch_batch (run_batch)",
+                            flush=True,
+                        )
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                    print(
-                        f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
-                        f"mb_id={mb_id} _pp_launch_batch DONE",
-                        flush=True,
-                    )
+                    if dflash_debug:
+                        print(
+                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                            f"mb_id={mb_id} _pp_launch_batch DONE",
+                            flush=True,
+                        )
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -167,11 +178,12 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                             )
-                        print(
-                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
-                            f"mb_id={mb_id} send_proxy queued (async)",
-                            flush=True,
-                        )
+                        if dflash_debug:
+                            print(
+                                f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                                f"mb_id={mb_id} send_proxy queued (async)",
+                                flush=True,
+                            )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -1055,6 +1067,11 @@ class SchedulerPPMixin:
         dflash_commit_lens = proxy_dict.get("dflash_commit_lens", None)
         dflash_committed_tokens = proxy_dict.get("dflash_committed_tokens", None)
         dflash_num_accepted = proxy_dict.get("dflash_num_accepted_tokens", None)
+        dflash_accept_length_per_req_cpu = (
+            [max(0, int(x) - 1) for x in dflash_commit_lens.to("cpu").tolist()]
+            if dflash_commit_lens is not None
+            else None
+        )
         if (
             not batch.spec_algorithm.is_none()
             and batch.spec_algorithm.is_dflash()
@@ -1080,6 +1097,7 @@ class SchedulerPPMixin:
                 if dflash_num_accepted is not None
                 else 0
             ),
+            accept_length_per_req_cpu=dflash_accept_length_per_req_cpu,
             dflash_next_candidates=dflash_next_candidates,
             dflash_next_positions=dflash_next_positions,
             dflash_commit_lens=dflash_commit_lens,
@@ -1138,12 +1156,25 @@ class SchedulerPPMixin:
                     "DFLASH PP follower could not locate pp_apply_follower_commit on "
                     f"the spec worker (got {type(worker).__name__})."
                 )
+            attn_backend = getattr(worker.target_worker.model_runner, "attn_backend", None)
+            need_mamba_verify_commit = hasattr(
+                attn_backend, "update_mamba_state_after_mtp_verify"
+            )
+            seq_lens_pre_verify = (
+                batch.seq_lens.clone() if need_mamba_verify_commit else None
+            )
             worker.pp_apply_follower_commit(
                 batch=batch,
                 verify_input=verify_input,
                 commit_lens=commit_lens,
                 committed_tokens=committed_tokens,
             )
+            if need_mamba_verify_commit:
+                worker._update_target_mamba_state_after_verify(
+                    batch=batch,
+                    seq_lens_pre_verify=seq_lens_pre_verify,
+                    commit_lens=commit_lens,
+                )
 
             # Mirror PP1's `batch.forward_mode = ForwardMode.DECODE` reset
             # (dflash_worker.py:1855) so the next iter's get_next_batch_to_run

@@ -53,6 +53,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+        self.current_arguments: dict[str, Any] = {}
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -281,6 +282,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.current_tool_param_count = 0
                     self.json_started = False
                     self.current_func_name = func_name
+                    self.current_arguments = {}
 
                     calls.append(
                         ToolCallItem(
@@ -289,6 +291,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             parameters="",
                         )
                     )
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({"name": "", "arguments": {}})
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": func_name,
+                        "arguments": self.current_arguments,
+                    }
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
 
                     self.parsed_pos += end_angle + 1
                     continue
@@ -347,6 +357,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                                     tool_index=self.current_tool_id, parameters="{"
                                 )
                             )
+                            self.streamed_args_for_tool[self.current_tool_id] += "{"
                             self.json_started = True
 
                         param_config = self._get_arguments_config(
@@ -355,6 +366,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         converted_val = self._convert_param_value(
                             raw_value, param_name, param_config, self.current_func_name
                         )
+                        self.current_arguments[param_name] = converted_val
 
                         # Construct JSON fragment: "key": value
                         # Note: We must be careful with json.dumps to ensure valid JSON streaming
@@ -370,6 +382,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                                 tool_index=self.current_tool_id, parameters=fragment
                             )
                         )
+                        self.streamed_args_for_tool[self.current_tool_id] += fragment
                         self.current_tool_param_count += 1
 
                         # Advance cursor
@@ -393,8 +406,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 calls.append(
                     ToolCallItem(tool_index=self.current_tool_id, parameters="}")
                 )
+                self.streamed_args_for_tool[self.current_tool_id] += "}"
                 self.parsed_pos += len(self.function_end_token)
                 self.current_func_name = None
+                self.current_arguments = {}
                 continue
 
             # -------------------------------------------------------

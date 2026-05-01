@@ -2020,14 +2020,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
-        # KT CPU offload only runs on the PP rank that owns the back-half
-        # layers (where the bulk of MoE blocks live and where lm_head is).
-        # On other PP ranks we skip every KT-side allocation/submit/sync.
+        # KT CPU offload must run on every PP rank that owns MoE layers.  The
+        # local-layer gating in FusedMoE only constructs this wrapper for
+        # layers resident on the current PP rank; if we disabled KT on
+        # non-last PP ranks, routed cold experts on those layers would be
+        # masked out of the GPU path and never computed.
         from sglang.srt.distributed import get_pp_group
         self.pp_group = get_pp_group()
-        self._is_kt_active_rank = (
-            self.tp_rank == 0 and self.pp_group.is_last_rank
-        )
+        self._is_kt_active_rank = self.tp_rank == 0
 
         # Mapping tables for non-contiguous GPU expert allocation (CPU tensors)
         # Used by weight_loader to remap expert_id when loading weights

@@ -672,6 +672,11 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -682,6 +687,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+
+        if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
 
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
@@ -924,18 +932,19 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                mapped_name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
                 # Skip layers on other devices.
-                # if is_pp_missing_parameter(name, self):
+                # if is_pp_missing_parameter(mapped_name, self):
                 #     continue
-                if name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[mapped_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
+                name = mapped_name
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -1068,17 +1077,18 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if "mlp.experts" in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                mapped_name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if mapped_name.endswith(ignore_suffixes) and mapped_name not in params_dict:
                     continue
 
-                if name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[mapped_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                name = mapped_name
                 break
             else:
                 # Track if this is an expert weight to enable early skipping
@@ -1230,18 +1240,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if "visual" in name or "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                mapped_name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
                 # Skip layers on other devices.
-                # if is_pp_missing_parameter(name, self):
+                # if is_pp_missing_parameter(mapped_name, self):
                 #     continue
-                if name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[mapped_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
+                name = mapped_name
                 break
             else:
                 if "visual" in name:
@@ -1433,17 +1444,18 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if "mlp.experts" in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                mapped_name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if mapped_name.endswith(ignore_suffixes) and mapped_name not in params_dict:
                     continue
 
-                if name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[mapped_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                name = mapped_name
                 break
             else:
                 # Track if this is an expert weight to enable early skipping

@@ -63,15 +63,54 @@ class AutoRoundConfig(QuantizationConfig):
         self.group_size = group_size
         self.sym = sym
         self.packing_format = packing_format
-        self.block_name_to_quantize = (
+        block_names = (
             block_name_to_quantize.split(",")
             if isinstance(block_name_to_quantize, str)
             else block_name_to_quantize
         )
-        self.extra_config = extra_config
+        self.block_name_to_quantize = self._expand_name_aliases_list(block_names)
+        self.extra_config = self._expand_extra_config(extra_config)
         self.data_type = data_type
         self.backend = backend
         self.pack_factor = Fraction(32, weight_bits)
+
+    @staticmethod
+    def _name_aliases(name: str) -> list[str]:
+        aliases = [name]
+        if "model.language_model." in name:
+            aliases.append(name.replace("model.language_model.", "model."))
+        if name.startswith("model.") and not name.startswith("model.language_model."):
+            aliases.append(name.replace("model.", "model.language_model.", 1))
+        if name.startswith("language_model."):
+            aliases.append(name.removeprefix("language_model."))
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(aliases))
+
+    @classmethod
+    def _expand_name_aliases_list(
+        cls, names: Optional[list[str]]
+    ) -> Optional[list[str]]:
+        if not names:
+            return names
+        aliases: list[str] = []
+        for name in names:
+            aliases.extend(cls._name_aliases(name))
+        return list(dict.fromkeys(aliases))
+
+    @classmethod
+    def _expand_extra_config(
+        cls, extra_config: Optional[dict[str, Any]]
+    ) -> Optional[dict[str, Any]]:
+        if not extra_config:
+            return extra_config
+        expanded = dict(extra_config)
+        for name, cfg in extra_config.items():
+            if not isinstance(name, str):
+                continue
+            for alias in cls._name_aliases(name):
+                expanded.setdefault(alias, cfg)
+        return expanded
 
     def __repr__(self) -> str:
         return (

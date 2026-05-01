@@ -2567,6 +2567,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
+        if can_run_graph and self.spec_algorithm.is_dflash():
+            if self.is_draft_worker:
+                can_run_graph = os.getenv("SGLANG_DFLASH_DISABLE_DRAFT_CUDA_GRAPH") not in (
+                    "1",
+                    "true",
+                    "TRUE",
+                )
+            else:
+                can_run_graph = os.getenv("SGLANG_DFLASH_DISABLE_TARGET_CUDA_GRAPH") not in (
+                    "1",
+                    "true",
+                    "TRUE",
+                )
 
         if can_run_graph:
             ret = self.graph_runner.replay(

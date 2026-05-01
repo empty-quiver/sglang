@@ -66,6 +66,7 @@ class HiRadixCache(RadixCache):
             bind_to_closest_numa_node_cuda()
 
         self.page_size = params.page_size
+        self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -595,6 +596,12 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
+        self.root_node.mamba_lock_ref = 1
+        self.mamba_evictable_size_ = 0
+        self.mamba_protected_size_ = 0
+
+    def supports_mamba(self) -> bool:
+        return hasattr(self.req_to_token_pool, "mamba_pool")
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -733,11 +740,56 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    def full_evictable_size(self):
+        return self.evictable_size_
+
+    def mamba_evictable_size(self):
+        return self.mamba_evictable_size_
+
+    def full_protected_size(self):
+        return self.protected_size_
+
+    def mamba_protected_size(self):
+        return self.mamba_protected_size_
+
+    def all_values_flatten(self):
+        values = []
+
+        def _dfs_helper(node: TreeNode):
+            for _, child in node.children.items():
+                if not child.evicted:
+                    values.append(child.value)
+                _dfs_helper(child)
+
+        _dfs_helper(self.root_node)
+        return torch.cat(values) if len(values) > 0 else torch.tensor([])
+
+    def all_mamba_values_flatten(self):
+        values = []
+
+        def _dfs_helper(node: TreeNode):
+            if node.mamba_value is not None:
+                values.append(node.mamba_value)
+            for _, child in node.children.items():
+                _dfs_helper(child)
+
+        _dfs_helper(self.root_node)
+        return torch.cat(values) if len(values) > 0 else torch.tensor([])
+
+    def sanity_check(self):
+        return
+
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
 
         delta = 0
+        if self.supports_mamba() and node.mamba_value is not None:
+            if node.mamba_lock_ref == 0:
+                self.mamba_evictable_size_ -= len(node.mamba_value)
+                self.mamba_protected_size_ += len(node.mamba_value)
+            node.mamba_lock_ref += 1
+
         while node != self.root_node:
             if node.lock_ref == 0:
                 self.evictable_size_ -= len(node.key)
@@ -754,6 +806,15 @@ class HiRadixCache(RadixCache):
             return 0
 
         delta = 0
+        if self.supports_mamba() and node.mamba_value is not None:
+            assert (
+                node.mamba_lock_ref > 0
+            ), f"dec_lock_ref on node with {node.mamba_lock_ref=}, {node.id=}"
+            if node.mamba_lock_ref == 1:
+                self.mamba_evictable_size_ += len(node.mamba_value)
+                self.mamba_protected_size_ -= len(node.mamba_value)
+            node.mamba_lock_ref -= 1
+
         while node != self.root_node:
             if node.lock_ref == 1:
                 self.evictable_size_ += len(node.key)
@@ -787,6 +848,7 @@ class HiRadixCache(RadixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
+        mamba_num = params.mamba_num
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -828,7 +890,39 @@ class HiRadixCache(RadixCache):
                 self._evict_backuped(node)
 
         self.update_eviction_metrics(num_evicted, start_time)
-        return EvictResult(num_tokens_evicted=num_evicted)
+        mamba_num_evicted = self.evict_mamba(mamba_num) if mamba_num > 0 else 0
+        return EvictResult(
+            num_tokens_evicted=num_evicted,
+            mamba_num_evicted=mamba_num_evicted,
+        )
+
+    def evict_mamba(self, mamba_num: int) -> int:
+        if self.disable or not self.supports_mamba() or mamba_num <= 0:
+            return 0
+
+        candidates: List[TreeNode] = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if (
+                node is not self.root_node
+                and node.mamba_value is not None
+                and node.mamba_lock_ref == 0
+            ):
+                candidates.append(node)
+            stack.extend(node.children.values())
+        candidates.sort(key=lambda node: node.last_access_time)
+
+        mamba_num_evicted = 0
+        for node in candidates:
+            if mamba_num_evicted >= mamba_num:
+                break
+            assert node.mamba_value is not None
+            self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+            mamba_num_evicted += len(node.mamba_value)
+            self.mamba_evictable_size_ -= len(node.mamba_value)
+            node.mamba_value = None
+        return mamba_num_evicted
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -1136,6 +1230,183 @@ class HiRadixCache(RadixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def cache_finished_req(self, req, is_insert: bool = True):
+        if not self.supports_mamba():
+            return super().cache_finished_req(req, is_insert=is_insert)
+
+        if self.disable_finished_insert:
+            is_insert = False
+
+        kv_committed_len = req.pop_committed_kv_cache()
+        if self.disable:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.req_to_token_pool.free_mamba_cache(req)
+            return
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+        mamba_ping_pong_track_buffer_to_keep = None
+
+        if is_insert:
+            cache_len = (
+                req.mamba_last_track_seqlen
+                if self.enable_mamba_extra_buffer
+                else len(token_ids)
+            )
+            if cache_len is None:
+                cache_len = 0
+            if cache_len != len(token_ids):
+                cache_end_idx = max(cache_len, req.cache_protected_len)
+                self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
+                token_ids = token_ids[:cache_len]
+                kv_indices = kv_indices[:cache_len]
+
+            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+            token_ids = token_ids[:page_aligned_len]
+
+            if self.enable_mamba_extra_buffer:
+                mamba_ping_pong_track_buffer_to_keep = (
+                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
+                )
+                mamba_value = (
+                    req.mamba_ping_pong_track_buffer[
+                        mamba_ping_pong_track_buffer_to_keep
+                    ]
+                    .unsqueeze(-1)
+                    .clone()
+                )
+            else:
+                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+
+            result = self.insert(
+                InsertParams(
+                    key=RadixKey(token_ids, req.extra_key),
+                    value=page_aligned_kv_indices,
+                    mamba_value=mamba_value,
+                    priority=getattr(req, "priority", 0) or 0,
+                )
+            )
+            new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : new_prefix_len]
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            mamba_exist = True
+
+        if mamba_exist:
+            mamba_ping_pong_track_buffer_to_keep = None
+
+        free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
+        if free_mamba_cache:
+            self.req_to_token_pool.free_mamba_cache(
+                req,
+                mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
+            )
+
+        self.dec_lock_ref(req.last_node)
+
+    def cache_unfinished_req(self, req, chunked=False):
+        if not self.supports_mamba():
+            return super().cache_unfinished_req(req, chunked=chunked)
+
+        def _skip_cache_unfinished_req(req) -> None:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+        token_ids = req.fill_ids
+        cache_len = (
+            req.mamba_last_track_seqlen
+            if self.enable_mamba_extra_buffer
+            else len(token_ids)
+        )
+        if self.disable or cache_len is None:
+            return _skip_cache_unfinished_req(req)
+
+        kv_indices_orig = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+        kv_indices = kv_indices_orig[:cache_len]
+        page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+        page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+        page_aligned_token_ids = token_ids[:page_aligned_len]
+
+        if self.enable_mamba_extra_buffer:
+            mamba_ping_pong_track_buffer_to_keep = (
+                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    req.mamba_next_track_idx
+                )
+            )
+            mamba_value = (
+                req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
+                .unsqueeze(-1)
+                .clone()
+            )
+        else:
+            mamba_value = self.req_to_token_pool.get_mamba_indices(
+                req.req_pool_idx
+            ).unsqueeze(-1)
+
+        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        if mamba_value_forked is None:
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                mamba_value
+            )
+            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+
+        result = self.insert(
+            InsertParams(
+                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                value=page_aligned_kv_indices,
+                mamba_value=mamba_value_forked,
+                chunked=chunked,
+                priority=getattr(req, "priority", 0) or 0,
+            )
+        )
+        new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[req.cache_protected_len : new_prefix_len]
+        )
+        if mamba_exist:
+            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+        )
+        new_indices, new_last_node = (
+            match_result.device_indices,
+            match_result.last_device_node,
+        )
+
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+            new_indices[req.cache_protected_len :],
+        )
+
+        self.dec_lock_ref(req.last_node)
+        self.inc_lock_ref(new_last_node)
+        req.prefix_indices = torch.cat(
+            [new_indices, kv_indices_orig[len(new_indices) :]]
+        )
+        req.cache_protected_len = len(new_indices)
+        req.mamba_last_track_seqlen = None
+        req.last_node = new_last_node
+
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -1152,13 +1423,25 @@ class HiRadixCache(RadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        if len(key) == 0:
+            return MatchResult(
+                device_indices=empty_value,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                host_hit_length=0,
+            )
+
+        if self.supports_mamba():
+            value, last_node = self._match_prefix_helper_mamba(self.root_node, key)
+        else:
+            value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
             value = empty_value
 
         host_hit_length = 0
+        mamba_source_node = last_node
         last_host_node = last_node
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
@@ -1166,11 +1449,33 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        if (
+            self.supports_mamba()
+            and params.cow_mamba
+            and params.req is not None
+            and mamba_source_node.mamba_value is not None
+        ):
+            if params.req.mamba_pool_idx is None:
+                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                if dst_index is None:
+                    self.inc_lock_ref(last_host_node)
+                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                    self.dec_lock_ref(last_host_node)
+                    assert dst_index is not None, "Can not alloc mamba cache"
+                params.req.mamba_pool_idx = dst_index[0]
+            else:
+                dst_index = params.req.mamba_pool_idx.unsqueeze(0)
+            self.req_to_token_pool.mamba_pool.copy_from(
+                mamba_source_node.mamba_value, dst_index
+            )
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
+            mamba_branching_seqlen=None,
         )
 
     def prefetch_from_storage(
@@ -1279,12 +1584,47 @@ class HiRadixCache(RadixCache):
 
         return value, node
 
+    def _match_prefix_helper_mamba(self, node: TreeNode, key: RadixKey):
+        node.last_access_time = time.monotonic()
+        child_key = self.get_child_key_fn(key)
+        value = []
+        best_value = []
+        best_node = self.root_node
+
+        while len(key) > 0 and child_key in node.children.keys():
+            child = node.children[child_key]
+            child.last_access_time = time.monotonic()
+            prefix_len = self.key_match_fn(child.key, key)
+            if prefix_len < len(child.key):
+                new_node = self._split_node(child.key, child, prefix_len)
+                if not new_node.evicted:
+                    value.append(new_node.value)
+                node = new_node
+                if node.mamba_value is not None:
+                    best_value = list(value)
+                    best_node = node
+                break
+
+            if not child.evicted:
+                value.append(child.value)
+            node = child
+            key = key[prefix_len:]
+            if node.mamba_value is not None:
+                best_value = list(value)
+                best_node = node
+
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        return best_value, best_node
+
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
+        new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 
@@ -1309,6 +1649,7 @@ class HiRadixCache(RadixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         key = params.key
         value = params.value
+        mamba_value = params.mamba_value
         chunked = params.chunked
         priority = params.priority
 
@@ -1317,7 +1658,10 @@ class HiRadixCache(RadixCache):
         key, value = self.maybe_bigram_convert(key, value)
 
         if len(key) == 0:
-            return InsertResult(prefix_len=0)
+            return InsertResult(
+                prefix_len=0,
+                mamba_exist=self.supports_mamba() and mamba_value is not None,
+            )
 
         if self.is_eagle and value is not None:
             # Make sure the value len equal to the EAGLE bigram key len
@@ -1326,6 +1670,7 @@ class HiRadixCache(RadixCache):
         node = self.root_node
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
+        mamba_exist = False
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
@@ -1374,6 +1719,9 @@ class HiRadixCache(RadixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            if self.supports_mamba() and mamba_value is not None:
+                new_node.mamba_value = mamba_value
+                self.mamba_evictable_size_ += len(mamba_value)
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
             self._update_leaf_status(node)
@@ -1385,7 +1733,13 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
-        return InsertResult(prefix_len=total_prefix_length)
+        elif self.supports_mamba() and mamba_value is not None:
+            if node.mamba_value is None:
+                node.mamba_value = mamba_value
+                self.mamba_evictable_size_ += len(mamba_value)
+            else:
+                mamba_exist = True
+        return InsertResult(prefix_len=total_prefix_length, mamba_exist=mamba_exist)
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request

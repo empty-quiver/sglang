@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import Optional, Tuple, Union
 
@@ -45,6 +46,8 @@ def _dflash_dbg(rank: int, msg: str) -> None:
     output still shows progress (or lack thereof) on stdout. All lines
     are tagged so they can be greped with `[DFLASH-DEBUG PP{rank}]`.
     """
+    if os.getenv("SGLANG_DFLASH_DEBUG") not in ("1", "true", "TRUE"):
+        return
     print(f"[DFLASH-DEBUG PP{rank}] {msg}", flush=True)
 
 

@@ -118,6 +118,11 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # Optional recurrent-state metadata used by Mamba/GDN-aware prefix
+        # caches. Plain radix caches ignore these fields.
+        self.mamba_value: Optional[torch.Tensor] = None
+        self.mamba_lock_ref = 0
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 

@@ -508,7 +508,14 @@ class CudaGraphRunner:
         )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+            # kt-kernel's CPU buffer cache is keyed by the MoE input token
+            # dimension, not by request batch size. Speculative verify graphs
+            # run bs * num_tokens_per_bs tokens, so DFlash must preserve buffers
+            # for the token counts captured by CUDA graph.
+            kt_capture_bs = sorted(
+                {bs * self.num_tokens_per_bs for bs in self.capture_bs}
+            )
+            KTMoEWrapper.set_capture_batch_sizes(kt_capture_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
