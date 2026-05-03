@@ -169,9 +169,10 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
@@ -2069,6 +2070,102 @@ class Scheduler(
 
         return ret
 
+    def _dflash_pp_release_transient_mamba_prefix(self, req: Req) -> None:
+        if (
+            getattr(req, "mamba_pool_idx", None) is not None
+            and getattr(req, "req_pool_idx", None) is None
+            and hasattr(self.req_to_token_pool, "mamba_pool")
+        ):
+            self.req_to_token_pool.mamba_pool.free(req.mamba_pool_idx.reshape(-1))
+            req.mamba_pool_idx = None
+
+    def _dflash_pp_reset_prefix_match(self, req: Req) -> None:
+        self._dflash_pp_release_transient_mamba_prefix(req)
+        device = (
+            req.prefix_indices.device
+            if isinstance(req.prefix_indices, torch.Tensor)
+            else torch.device("cpu")
+        )
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64, device=device)
+        req.last_node = self.tree_cache.root_node
+        req.last_host_node = self.tree_cache.root_node
+        req.host_hit_length = 0
+        req.cache_protected_len = 0
+        req.mamba_branching_seqlen = None
+        req.set_extend_input_len(len(req.fill_ids))
+
+    def _dflash_pp_force_prefix_len(self, req: Req, prefix_len: int) -> None:
+        target_prefix_len = max(0, int(prefix_len))
+        max_prefix_len = max(len(req.fill_ids) - 1, 0)
+        if req.return_logprob and req.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, req.logprob_start_len)
+        target_prefix_len = min(target_prefix_len, max_prefix_len)
+
+        if target_prefix_len == 0:
+            self._dflash_pp_reset_prefix_match(req)
+            return
+
+        if (
+            len(req.prefix_indices) == target_prefix_len
+            and req.host_hit_length == 0
+            and (
+                not self.tree_cache.supports_mamba()
+                or getattr(req, "mamba_pool_idx", None) is not None
+            )
+        ):
+            req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+            return
+
+        self._dflash_pp_release_transient_mamba_prefix(req)
+        match_result = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=req.fill_ids[:target_prefix_len],
+                    extra_key=req.extra_key,
+                ),
+                req=req if self.tree_cache.supports_mamba() else None,
+                cow_mamba=self.tree_cache.supports_mamba(),
+            )
+        )
+        (
+            req.prefix_indices,
+            req.last_node,
+            req.last_host_node,
+            req.host_hit_length,
+            req.mamba_branching_seqlen,
+        ) = (
+            match_result.device_indices,
+            match_result.last_device_node,
+            match_result.last_host_node,
+            match_result.host_hit_length,
+            match_result.mamba_branching_seqlen,
+        )
+        req.cache_protected_len = len(req.prefix_indices)
+
+        if (
+            len(req.prefix_indices) != target_prefix_len
+            or req.host_hit_length != 0
+            or (
+                self.tree_cache.supports_mamba()
+                and getattr(req, "mamba_pool_idx", None) is None
+            )
+        ):
+            raise RuntimeError(
+                "DFLASH PP prefix consensus could not rematch a safe local "
+                f"prefix: pp={self.pp_rank}, rid={req.rid}, "
+                f"target={target_prefix_len}, matched={len(req.prefix_indices)}, "
+                f"host_hit_length={req.host_hit_length}, "
+                f"has_mamba={getattr(req, 'mamba_pool_idx', None) is not None}."
+            )
+
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+
+    def _dflash_pp_consensus_prefix_len_for_req(self, req: Req) -> Optional[int]:
+        prefix_map = getattr(self, "dflash_pp_consensus_prefix_lens_by_rid", None)
+        if not prefix_map:
+            return None
+        return prefix_map.get(str(req.rid))
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2188,12 +2285,16 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            forced_prefix_len = self._dflash_pp_consensus_prefix_len_for_req(req)
+            if forced_prefix_len is not None:
+                self._dflash_pp_force_prefix_len(req, forced_prefix_len)
             if (
                 self.pp_size > 1
                 and self.spec_algorithm is not None
                 and self.spec_algorithm.is_dflash()
                 and os.getenv("SGLANG_DFLASH_PP_EXACT_PREFIX_CACHE")
                 in ("1", "true", "TRUE")
+                and forced_prefix_len is None
                 and len(req.prefix_indices) > 0
             ):
                 # In DFlash PP with hybrid Mamba/HiCache, partial radix hits can
@@ -2213,26 +2314,7 @@ class Scheduler(
                             "partial prefix hits to keep PP ranks synchronized."
                         )
                         self.dflash_pp_exact_prefix_cache_warned = True
-                    if (
-                        getattr(req, "mamba_pool_idx", None) is not None
-                        and hasattr(self.req_to_token_pool, "mamba_pool")
-                    ):
-                        # `match_prefix(..., cow_mamba=True)` can copy a cached
-                        # Mamba state before the request has a req-pool slot. Do
-                        # not call the full request-pool free path here because
-                        # it also frees per-req ping-pong buffers via
-                        # req.req_pool_idx, which is still unset.
-                        self.req_to_token_pool.mamba_pool.free(
-                            req.mamba_pool_idx.unsqueeze(0)
-                        )
-                        req.mamba_pool_idx = None
-                    req.prefix_indices = torch.empty((0,), dtype=torch.int64)
-                    req.last_node = self.tree_cache.root_node
-                    req.last_host_node = self.tree_cache.root_node
-                    req.host_hit_length = 0
-                    req.cache_protected_len = 0
-                    req.mamba_branching_seqlen = None
-                    req.set_extend_input_len(len(req.fill_ids))
+                    self._dflash_pp_reset_prefix_match(req)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

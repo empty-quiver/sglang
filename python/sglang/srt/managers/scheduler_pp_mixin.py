@@ -35,6 +35,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 
@@ -440,6 +442,7 @@ class SchedulerPPMixin:
                         mb_id=mb_id,
                         recv=len(recv_reqs),
                     )
+                self._pp_dflash_refresh_prefix_consensus()
                 phase_t = time.perf_counter()
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     dflash_run_control = None
@@ -1431,6 +1434,75 @@ class SchedulerPPMixin:
             and self.spec_algorithm.is_dflash()
         )
 
+    def _pp_dflash_prefix_consensus_enabled(self: Scheduler) -> bool:
+        return self._pp_dflash_run_control_enabled() and _dflash_env_enabled(
+            "SGLANG_DFLASH_PP_PREFIX_CONSENSUS"
+        )
+
+    def _pp_dflash_prefix_candidate_len(self: Scheduler, req: Req) -> int:
+        if self.tree_cache is None or getattr(self.tree_cache, "disable", False):
+            return 0
+
+        if req.is_dllm():
+            fill_ids = req.origin_input_ids + req.output_ids
+        else:
+            fill_ids = req.origin_input_ids + req.output_ids
+        max_prefix_len = max(len(fill_ids) - 1, 0)
+        if req.return_logprob and req.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, req.logprob_start_len)
+        if max_prefix_len <= 0:
+            return 0
+
+        match_result = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=fill_ids[:max_prefix_len],
+                    extra_key=req.extra_key,
+                ),
+                req=None,
+                cow_mamba=False,
+            )
+        )
+        # Use only device-resident, Mamba-valid prefix length. Host/HiCache load
+        # back remains a separate follow-up because it needs rank-consistent
+        # storage prefetch completion as well as a recurrent-state boundary.
+        return int(len(match_result.device_indices))
+
+    def _pp_dflash_refresh_prefix_consensus(self: Scheduler) -> None:
+        if not self._pp_dflash_prefix_consensus_enabled():
+            self.dflash_pp_consensus_prefix_lens_by_rid = None
+            return
+
+        local_candidates = {
+            str(req.rid): self._pp_dflash_prefix_candidate_len(req)
+            for req in self.waiting_queue
+            if req.to_finish is None and not req.finished()
+        }
+        gathered = [None for _ in range(self.pp_size)]
+        torch.distributed.all_gather_object(
+            gathered, local_candidates, group=self.pp_group.cpu_group
+        )
+
+        consensus = {}
+        for rid in local_candidates:
+            values = []
+            for rank_candidates in gathered:
+                if not isinstance(rank_candidates, dict) or rid not in rank_candidates:
+                    values = [0]
+                    break
+                values.append(int(rank_candidates[rid]))
+            consensus[rid] = min(values) if values else 0
+
+        self.dflash_pp_consensus_prefix_lens_by_rid = consensus
+        if _dflash_env_enabled("SGLANG_DFLASH_PP_PREFIX_CONSENSUS_TRACE"):
+            logger.info(
+                "DFLASH PP prefix consensus pp=%s local=%s gathered=%s consensus=%s",
+                self.pp_rank,
+                local_candidates,
+                gathered,
+                consensus,
+            )
+
     def _pp_dflash_select_authoritative_batch(
         self: Scheduler, mb_id: int
     ) -> Optional[ScheduleBatch]:
@@ -1503,6 +1575,9 @@ class SchedulerPPMixin:
             "forward_mode": int(batch.forward_mode) if run else -1,
             "rid_hashes": tuple(_dflash_batch_rid_hashes(batch)) if run else (),
             "token_count": int(token_count) if token_count is not None else -1,
+            "prefix_lens": tuple(int(len(req.prefix_indices)) for req in batch.reqs)
+            if run
+            else (),
         }
         _dflash_log_timeline(
             self,
