@@ -25,8 +25,10 @@ If you only need to use the distributed environment without model/pipeline
 import contextlib
 import gc
 import logging
+import math
 import os
 import pickle
+import time
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -67,6 +69,29 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
+
+
+def _pp_tensor_dict_timing_enabled() -> bool:
+    return os.getenv("SGLANG_PP_TENSOR_DICT_TIMING") in ("1", "true", "TRUE")
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _metadata_nbytes(value: TensorMetadata) -> int:
+    return int(math.prod(value.size)) * int(
+        torch.empty((), dtype=value.dtype).element_size()
+    )
+
+
+def _log_tensor_dict_timing(direction: str, **fields) -> None:
+    if not _pp_tensor_dict_timing_enabled():
+        return
+    parts = [f"direction={direction}"]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    logger.info("PP tensor_dict timing %s", " ".join(parts))
 
 
 @dataclass
@@ -1247,6 +1272,10 @@ class GroupCoordinator:
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        tensor_keys = [
+            key for key, value in metadata_list if isinstance(value, TensorMetadata)
+        ]
+        tensor_bytes = sum(_tensor_nbytes(tensor) for tensor in tensor_list)
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
         # show better overall transmission performance with D2D due to:
@@ -1255,7 +1284,16 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
+        timing_enabled = _pp_tensor_dict_timing_enabled()
+        timing_start = time.perf_counter() if timing_enabled else None
+        metadata_start = time.perf_counter() if timing_enabled else None
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        metadata_ms = (
+            (time.perf_counter() - metadata_start) * 1000.0
+            if metadata_start is not None
+            else None
+        )
+        tensor_post_ms = 0.0
 
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -1267,9 +1305,27 @@ class GroupCoordinator:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
+            tensor_start = time.perf_counter() if timing_enabled else None
             work = send_func(tensor, self.ranks[dst], group=comm_group)
+            if tensor_start is not None:
+                tensor_post_ms += (time.perf_counter() - tensor_start) * 1000.0
             if async_send:
                 p2p_works.append(P2PWork(work, tensor))
+        if timing_enabled:
+            total_ms = (time.perf_counter() - timing_start) * 1000.0
+            _log_tensor_dict_timing(
+                "send",
+                rank=self.rank,
+                group_rank=self.rank_in_group,
+                peer=self.ranks[dst],
+                async_send=async_send,
+                tensors=len(tensor_list),
+                keys=tensor_keys,
+                total_mb=f"{tensor_bytes / 1024**2:.3f}",
+                metadata_ms=f"{metadata_ms:.3f}",
+                tensor_post_ms=f"{tensor_post_ms:.3f}",
+                total_ms=f"{total_ms:.3f}",
+            )
         return p2p_works
 
     def recv_tensor_dict(
@@ -1296,10 +1352,26 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
+        timing_enabled = _pp_tensor_dict_timing_enabled()
+        timing_start = time.perf_counter() if timing_enabled else None
+        metadata_start = time.perf_counter() if timing_enabled else None
         recv_metadata_list = self.recv_object(src=src)
+        metadata_ms = (
+            (time.perf_counter() - metadata_start) * 1000.0
+            if metadata_start is not None
+            else None
+        )
         tensor_dict: Dict[str, Any] = {}
+        tensor_wait_ms = 0.0
+        all_gather_ms = 0.0
+        cpu_wait_ms = 0.0
+        device_wait_ms = 0.0
+        tensor_bytes = 0
+        tensor_keys = []
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
+                tensor_keys.append(key)
+                tensor_bytes += _metadata_nbytes(value)
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
@@ -1318,18 +1390,46 @@ class GroupCoordinator:
 
                 # We have to use irecv here to make it work for both isend and send.
                 comm_group = metadata_group if tensor.is_cpu else group
+                tensor_start = time.perf_counter() if timing_enabled else None
                 work = torch.distributed.irecv(
                     tensor, src=self.ranks[src], group=comm_group
                 )
                 work.wait()
+                if tensor_start is not None:
+                    elapsed_ms = (time.perf_counter() - tensor_start) * 1000.0
+                    tensor_wait_ms += elapsed_ms
+                    if tensor.is_cpu:
+                        cpu_wait_ms += elapsed_ms
+                    else:
+                        device_wait_ms += elapsed_ms
 
                 if use_all_gather:
+                    gather_start = time.perf_counter() if timing_enabled else None
                     tensor = all_gather_group.all_gather(tensor, dim=0)
+                    if gather_start is not None:
+                        all_gather_ms += (time.perf_counter() - gather_start) * 1000.0
                     tensor = tensor.reshape(orig_shape)
 
                 tensor_dict[key] = tensor
             else:
                 tensor_dict[key] = value
+        if timing_enabled:
+            total_ms = (time.perf_counter() - timing_start) * 1000.0
+            _log_tensor_dict_timing(
+                "recv",
+                rank=self.rank,
+                group_rank=self.rank_in_group,
+                peer=self.ranks[src],
+                tensors=len(tensor_keys),
+                keys=tensor_keys,
+                total_mb=f"{tensor_bytes / 1024**2:.3f}",
+                metadata_ms=f"{metadata_ms:.3f}",
+                tensor_wait_ms=f"{tensor_wait_ms:.3f}",
+                device_wait_ms=f"{device_wait_ms:.3f}",
+                cpu_wait_ms=f"{cpu_wait_ms:.3f}",
+                all_gather_ms=f"{all_gather_ms:.3f}",
+                total_ms=f"{total_ms:.3f}",
+            )
         return tensor_dict
 
     def barrier(self):

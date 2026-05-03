@@ -63,6 +63,41 @@ def _dflash_route_timing_enabled() -> bool:
     return _dflash_env_enabled("SGLANG_DFLASH_PP_ROUTE_TIMING")
 
 
+def _pp_proxy_ready_sync_timing_enabled() -> bool:
+    return _dflash_env_enabled("SGLANG_PP_PROXY_READY_SYNC_TIMING")
+
+
+def _pp_log_proxy_ready_sync(
+    scheduler: "Scheduler",
+    mb_id: int,
+    batch: Optional[ScheduleBatch],
+    metadata: Optional["PPBatchMetadata"],
+    launch_event: Optional[torch.cuda.Event],
+) -> None:
+    if (
+        not _pp_proxy_ready_sync_timing_enabled()
+        or launch_event is None
+        or not torch.cuda.is_available()
+    ):
+        return
+
+    start = time.perf_counter()
+    launch_event.synchronize()
+    sync_ms = (time.perf_counter() - start) * 1000.0
+    logger.info(
+        "PP proxy ready sync pp=%s mb_id=%s mode=%s bs=%s token_count=%s "
+        "cuda_graph=%s dispatch_seq=%s sync_ms=%.3f",
+        scheduler.pp_rank,
+        mb_id,
+        batch.forward_mode.name if batch is not None else None,
+        batch.batch_size() if batch is not None else None,
+        _dflash_batch_token_count(batch) if batch is not None else None,
+        metadata.can_run_cuda_graph if metadata is not None else None,
+        metadata.dispatch_seq if metadata is not None else None,
+        sync_ms,
+    )
+
+
 _DFLASH_ROUTE_TIMING_PHASES = {
     "pp.select_batch",
     "pp.proxy.recv",
@@ -671,6 +706,13 @@ class SchedulerPPMixin:
                             )
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
+                        _pp_log_proxy_ready_sync(
+                            self,
+                            mb_id,
+                            self.cur_batch,
+                            self.mb_metadata[mb_id],
+                            self.launch_event,
+                        )
                         torch.cuda.current_stream().wait_event(self.launch_event)
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
@@ -932,6 +974,13 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if self.cur_batch:
+                        _pp_log_proxy_ready_sync(
+                            self,
+                            mb_id,
+                            self.cur_batch,
+                            self.mb_metadata[mb_id],
+                            self.launch_event,
+                        )
                         torch.cuda.current_stream().wait_event(self.launch_event)
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
@@ -1112,6 +1161,13 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
+                        _pp_log_proxy_ready_sync(
+                            self,
+                            mb_id,
+                            self.cur_batch,
+                            self.mb_metadata[mb_id],
+                            self.launch_event,
+                        )
                         torch.cuda.current_stream().wait_event(self.launch_event)
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
@@ -2337,7 +2393,9 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(
                 self.pp_group.recv_tensor_dict(
                     all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
+                        self.attn_tp_group
+                        if self.require_attn_tp_allgather
+                        else None
                     )
                 )
             )
