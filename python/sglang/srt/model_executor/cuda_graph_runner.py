@@ -20,6 +20,7 @@ import gc
 import inspect
 import logging
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -91,6 +92,18 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _cuda_graph_replay_timing_enabled() -> bool:
+    return os.getenv("SGLANG_CUDA_GRAPH_REPLAY_TIMING") in ("1", "true", "TRUE")
+
+
+def _cuda_graph_replay_timing_sync_enabled() -> bool:
+    return os.getenv("SGLANG_CUDA_GRAPH_REPLAY_TIMING_SYNC") in (
+        "1",
+        "true",
+        "TRUE",
+    )
 
 
 @dataclass
@@ -472,6 +485,17 @@ class CudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_replay_timing = _cuda_graph_replay_timing_enabled()
+        self.enable_replay_timing_sync = (
+            self.enable_replay_timing
+            and _cuda_graph_replay_timing_sync_enabled()
+            and torch.cuda.is_available()
+        )
+        self._replay_timing_start_event = None
+        self._replay_timing_end_event = None
+        if self.enable_replay_timing_sync:
+            self._replay_timing_start_event = torch.cuda.Event(enable_timing=True)
+            self._replay_timing_end_event = torch.cuda.Event(enable_timing=True)
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -604,6 +628,25 @@ class CudaGraphRunner:
             except Exception:
                 return 0
         return 0
+
+    def _log_replay_timing(
+        self, phase: str, start_time: Optional[float] = None, **fields
+    ):
+        if not self.enable_replay_timing:
+            return
+        parts = [
+            f"phase={phase}",
+            f"pp={getattr(self.model_runner, 'pp_rank', None)}",
+            f"tp={getattr(self.model_runner, 'tp_rank', None)}",
+            f"draft_worker={getattr(self.model_runner, 'is_draft_worker', None)}",
+            f"dflash={self.model_runner.spec_algorithm.is_dflash()}",
+        ]
+        if start_time is not None:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            parts.append(f"elapsed_ms={elapsed_ms:.3f}")
+        for key, value in fields.items():
+            parts.append(f"{key}={value}")
+        logger.info("CudaGraph replay timing %s", " ".join(parts))
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -1093,8 +1136,20 @@ class CudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.deepep_adapter.replay()
 
+        total_t = time.perf_counter() if self.enable_replay_timing else None
+        prepare_t = time.perf_counter() if self.enable_replay_timing else None
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
+            self._log_replay_timing(
+                "prepare",
+                prepare_t,
+                skip_attn_backend_init=skip_attn_backend_init,
+                forward_mode=forward_batch.forward_mode.name,
+                raw_bs=self.raw_bs,
+                raw_num_token=self.raw_num_token,
+                padded_bs=self.bs,
+                num_tokens_per_bs=self.num_tokens_per_bs,
+            )
         else:
             # The caller already initialized attention metadata through
             # replay_prepare. Keep the graph input buffers fresh as well, so
@@ -1156,14 +1211,59 @@ class CudaGraphRunner:
                 and forward_batch.input_embeds is not None
             ):
                 buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
+            self._log_replay_timing(
+                "buffer_refresh",
+                prepare_t,
+                skip_attn_backend_init=skip_attn_backend_init,
+                forward_mode=forward_batch.forward_mode.name,
+                raw_bs=self.raw_bs,
+                raw_num_token=self.raw_num_token,
+                padded_bs=self.bs,
+                num_tokens_per_bs=self.num_tokens_per_bs,
+            )
 
         # Replay
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
+        graph_t = time.perf_counter() if self.enable_replay_timing else None
+        if self.enable_replay_timing_sync:
+            assert self._replay_timing_start_event is not None
+            assert self._replay_timing_end_event is not None
+            self._replay_timing_start_event.record()
         self.graphs[graph_key].replay()
+        gpu_elapsed_ms = None
+        if self.enable_replay_timing_sync:
+            self._replay_timing_end_event.record()
+            self._replay_timing_end_event.synchronize()
+            gpu_elapsed_ms = self._replay_timing_start_event.elapsed_time(
+                self._replay_timing_end_event
+            )
+        self._log_replay_timing(
+            "graph_replay",
+            graph_t,
+            graph_key=graph_key,
+            forward_mode=forward_batch.forward_mode.name,
+            raw_bs=self.raw_bs,
+            raw_num_token=self.raw_num_token,
+            padded_bs=self.bs,
+            num_tokens_per_bs=self.num_tokens_per_bs,
+            gpu_elapsed_ms=(
+                f"{gpu_elapsed_ms:.3f}" if gpu_elapsed_ms is not None else None
+            ),
+        )
         output = self.output_buffers[graph_key]
+        self._log_replay_timing(
+            "total_before_output_slice",
+            total_t,
+            graph_key=graph_key,
+            forward_mode=forward_batch.forward_mode.name,
+            raw_bs=self.raw_bs,
+            raw_num_token=self.raw_num_token,
+            padded_bs=self.bs,
+            num_tokens_per_bs=self.num_tokens_per_bs,
+        )
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
