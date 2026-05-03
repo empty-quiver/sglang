@@ -1,4 +1,7 @@
-from typing import Tuple, Union
+import logging
+import os
+import time
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -46,6 +49,76 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+
+logger = logging.getLogger(__name__)
+
+
+def _gdn_timing_enabled() -> bool:
+    return os.getenv("SGLANG_GDN_TIMING") in ("1", "true", "TRUE")
+
+
+def _gdn_timing_sync_enabled() -> bool:
+    return os.getenv("SGLANG_GDN_TIMING_SYNC") in ("1", "true", "TRUE")
+
+
+def _gdn_timing_sync_allowed() -> bool:
+    if not _gdn_timing_sync_enabled():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return not torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _gdn_timing_layer_enabled(layer_id: int) -> bool:
+    layers = os.getenv("SGLANG_GDN_TIMING_LAYERS")
+    if not layers:
+        return True
+    wanted = set()
+    for raw in layers.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if "-" in raw:
+            start, end = raw.split("-", 1)
+            wanted.update(range(int(start), int(end) + 1))
+        else:
+            wanted.add(int(raw))
+    return int(layer_id) in wanted
+
+
+def _gdn_timing_start(layer_id: int) -> Optional[float]:
+    if not _gdn_timing_enabled() or not _gdn_timing_layer_enabled(layer_id):
+        return None
+    if _gdn_timing_sync_allowed():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _gdn_log_timing(
+    layer_id: int,
+    phase: str,
+    start_time: Optional[float],
+    **fields,
+) -> None:
+    if start_time is None:
+        return
+    if not _gdn_timing_enabled() or not _gdn_timing_layer_enabled(layer_id):
+        return
+    if _gdn_timing_sync_allowed():
+        torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    parts = [
+        f"phase={phase}",
+        f"layer={layer_id}",
+        f"elapsed_ms={elapsed_ms:.3f}",
+    ]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    logger.info("GDN timing %s", " ".join(parts))
 
 
 class GDNKernelDispatcher:
@@ -288,6 +361,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
+            t_conv = _gdn_timing_start(layer.layer_id)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -300,6 +374,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
+            )
+            _gdn_log_timing(
+                layer.layer_id,
+                "gdn.target_verify.conv_update",
+                t_conv,
+                tokens=seq_len,
+                batch_size=batch_size,
+                draft_tokens=draft_token_num,
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
@@ -315,6 +397,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
 
+            t_conv = _gdn_timing_start(layer.layer_id)
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,
                 layer.conv_weights,
@@ -326,6 +409,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
+            _gdn_log_timing(
+                layer.layer_id,
+                "gdn.extend.conv",
+                t_conv,
+                tokens=seq_len,
+                batch_size=forward_batch.batch_size,
+            )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -338,9 +428,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
+        t_gating = _gdn_timing_start(layer.layer_id)
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        _gdn_log_timing(
+            layer.layer_id,
+            "gdn.gating",
+            t_gating,
+            tokens=seq_len,
+            target_verify=is_target_verify,
+        )
 
         if is_target_verify:
+            t_kernel = _gdn_timing_start(layer.layer_id)
             core_attn_out = self.kernel_dispatcher.target_verify(
                 q=query,
                 k=key,
@@ -355,7 +454,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )
+            _gdn_log_timing(
+                layer.layer_id,
+                "gdn.target_verify.kernel",
+                t_kernel,
+                tokens=seq_len,
+                batch_size=batch_size,
+                draft_tokens=draft_token_num,
+            )
         else:
+            t_kernel = _gdn_timing_start(layer.layer_id)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -365,6 +473,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+            )
+            _gdn_log_timing(
+                layer.layer_id,
+                "gdn.extend.kernel",
+                t_kernel,
+                tokens=seq_len,
+                batch_size=forward_batch.batch_size,
             )
             if is_npu() or is_cpu():
                 last_recurrent_state = last_recurrent_state.to(

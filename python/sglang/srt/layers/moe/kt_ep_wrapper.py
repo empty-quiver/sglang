@@ -73,6 +73,10 @@ def _kt_timing_sync_allowed() -> bool:
         return False
 
 
+def _kt_hitmiss_timing_enabled() -> bool:
+    return os.getenv("SGLANG_KT_HITMISS_TIMING") in ("1", "true", "TRUE")
+
+
 def _kt_timing_layer_enabled(layer_idx: int) -> bool:
     layers = os.getenv("SGLANG_KT_TIMING_LAYERS")
     if not layers:
@@ -135,6 +139,58 @@ def _kt_log_timing(method, phase: str, start_time: Optional[float] = None, **fie
     for key, value in fields.items():
         parts.append(f"{key}={value}")
     logger.info("KT timing %s", " ".join(parts))
+
+
+def _kt_log_hitmiss(
+    method,
+    topk_ids: torch.Tensor,
+    gpu_experts_mask: torch.Tensor,
+    num_tokens: int,
+) -> None:
+    if not _kt_hitmiss_timing_enabled():
+        return
+    if not _kt_timing_enabled() or not _kt_timing_layer_enabled(method.kt_config.layer_idx):
+        return
+    if not getattr(method, "_is_kt_active_rank", False):
+        return
+    if torch.cuda.is_available():
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+        except Exception:
+            return
+
+    t_hitmiss = time.perf_counter()
+    with torch.no_grad():
+        is_gpu_expert = gpu_experts_mask[topk_ids]
+        total_choices = int(topk_ids.numel())
+        gpu_choices = int(is_gpu_expert.sum().item())
+        cpu_choices = total_choices - gpu_choices
+        unique_gpu = (
+            int(topk_ids[is_gpu_expert].unique().numel())
+            if gpu_choices > 0
+            else 0
+        )
+        unique_cpu = (
+            int(topk_ids[~is_gpu_expert].unique().numel())
+            if cpu_choices > 0
+            else 0
+        )
+
+    cpu_pct = (100.0 * cpu_choices / total_choices) if total_choices else 0.0
+    _kt_log_timing(
+        method,
+        "kt.hitmiss",
+        t_hitmiss,
+        tokens=num_tokens,
+        topk_shape=tuple(topk_ids.shape),
+        total_choices=total_choices,
+        gpu_choices=gpu_choices,
+        cpu_choices=cpu_choices,
+        cpu_pct=f"{cpu_pct:.1f}",
+        unique_gpu=unique_gpu,
+        unique_cpu=unique_cpu,
+    )
 
 
 @dataclass
@@ -3132,6 +3188,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
         topk_ids = topk_output.topk_ids
+        _kt_log_hitmiss(
+            self,
+            topk_ids,
+            self.gpu_experts_mask_cuda,
+            num_tokens,
+        )
         t_mask = time.perf_counter()
         masked_topk_ids = mask_and_remap_expert_ids(
             topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
@@ -3152,8 +3214,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 3: Execute GPU expert computation on main stream
         # No wait needed - staging buffer decouples CPU and GPU data access
+        current_stream = torch.cuda.current_stream(x.device)
+        gpu_timing_start_event = None
+        gpu_timing_end_event = None
+        if _kt_timing_sync_allowed() and _kt_timing_layer_enabled(
+            self.kt_config.layer_idx
+        ):
+            gpu_timing_start_event = torch.cuda.Event(enable_timing=True)
+            gpu_timing_end_event = torch.cuda.Event(enable_timing=True)
+            gpu_timing_start_event.record(current_stream)
         t_gpu = time.perf_counter()
         gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+        if gpu_timing_end_event is not None:
+            gpu_timing_end_event.record(current_stream)
         _kt_log_timing(
             self,
             "kt.gpu_apply_enqueue",
@@ -3173,13 +3246,43 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
             # Main stream waits for cpu_stream to complete before merging results
             t_wait_event = time.perf_counter()
-            torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+            main_wait_start_event = None
+            main_wait_end_event = None
+            if _kt_timing_sync_allowed() and _kt_timing_layer_enabled(
+                self.kt_config.layer_idx
+            ):
+                main_wait_start_event = torch.cuda.Event(enable_timing=True)
+                main_wait_end_event = torch.cuda.Event(enable_timing=True)
+                main_wait_start_event.record(current_stream)
+            current_stream.wait_event(self._sync_done_event)
+            if main_wait_end_event is not None:
+                main_wait_end_event.record(current_stream)
             _kt_log_timing(
                 self,
                 "kt.main_wait_cpu_event_enqueue",
                 t_wait_event,
                 tokens=num_tokens,
             )
+            if gpu_timing_start_event is not None and gpu_timing_end_event is not None:
+                gpu_timing_end_event.synchronize()
+                _kt_log_timing(
+                    self,
+                    "kt.gpu_apply_elapsed",
+                    tokens=num_tokens,
+                    elapsed_ms=(
+                        f"{gpu_timing_start_event.elapsed_time(gpu_timing_end_event):.3f}"
+                    ),
+                )
+            if main_wait_start_event is not None and main_wait_end_event is not None:
+                main_wait_end_event.synchronize()
+                _kt_log_timing(
+                    self,
+                    "kt.main_wait_cpu_event_elapsed",
+                    tokens=num_tokens,
+                    elapsed_ms=(
+                        f"{main_wait_start_event.elapsed_time(main_wait_end_event):.3f}"
+                    ),
+                )
             if cpu_timing_start_event is not None and cpu_timing_end_event is not None:
                 cpu_timing_end_event.synchronize()
                 _kt_log_timing(
@@ -3197,6 +3300,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "kt.merge_enqueue",
                 t_merge,
                 tokens=num_tokens,
+            )
+        elif gpu_timing_start_event is not None and gpu_timing_end_event is not None:
+            gpu_timing_end_event.synchronize()
+            _kt_log_timing(
+                self,
+                "kt.gpu_apply_elapsed",
+                tokens=num_tokens,
+                elapsed_ms=(
+                    f"{gpu_timing_start_event.elapsed_time(gpu_timing_end_event):.3f}"
+                ),
             )
 
         return StandardCombineInput(hidden_states=output)
