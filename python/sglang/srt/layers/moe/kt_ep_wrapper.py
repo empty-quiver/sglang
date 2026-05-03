@@ -15,7 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -90,6 +90,31 @@ def _kt_timing_layer_enabled(layer_idx: int) -> bool:
     return int(layer_idx) in wanted
 
 
+def _kt_full_gpu_fallback_min_free_bytes() -> int:
+    raw = os.getenv("SGLANG_KT_FULL_GPU_FALLBACK_MIN_FREE_GB", "2.5")
+    try:
+        value_gb = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_FULL_GPU_FALLBACK_MIN_FREE_GB=%r; using 2.5",
+            raw,
+        )
+        value_gb = 2.5
+    return int(max(value_gb, 0.0) * 1024**3)
+
+
+def _looks_like_cuda_oom(err: Exception) -> bool:
+    if isinstance(err, torch.OutOfMemoryError):
+        return True
+    text = str(err).lower()
+    return (
+        "out of memory" in text
+        or "cuda calloc" in text
+        or "ncclunhandledcudaerror" in text
+        or "failed to cuda" in text
+    )
+
+
 def _kt_log_timing(method, phase: str, start_time: Optional[float] = None, **fields):
     if not _kt_timing_enabled() or not _kt_timing_layer_enabled(method.kt_config.layer_idx):
         return
@@ -147,6 +172,7 @@ class KTConfig:
 
 _SHARED_FULL_CONTEXT = None
 _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
+_KT_FULL_GPU_FALLBACK_DISABLED = False
 
 
 class SharedStagingBuffer:
@@ -1614,6 +1640,179 @@ def generate_frequency_uniform_masks(
     return masks
 
 
+def _moe_layer_indices(
+    num_layers: int,
+    first_k_dense_replace: int,
+    moe_layer_freq: int,
+) -> List[int]:
+    return [
+        i
+        for i in range(num_layers)
+        if i >= first_k_dense_replace and i % moe_layer_freq == 0
+    ]
+
+
+def _set_non_moe_layers_to_gpu(
+    masks: torch.Tensor,
+    first_k_dense_replace: int,
+    moe_layer_freq: int,
+) -> None:
+    for layer_idx in range(masks.shape[0]):
+        if layer_idx < first_k_dense_replace or layer_idx % moe_layer_freq != 0:
+            masks[layer_idx, :] = True
+
+
+def _parse_int_env_list(name: str) -> Optional[List[int]]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError as err:
+            raise ValueError(f"Invalid integer in {name}={raw!r}: {item!r}") from err
+        if value < 0:
+            raise ValueError(f"{name} must not contain negative counts: {raw!r}")
+        values.append(value)
+
+    if not values:
+        raise ValueError(f"{name} was set but did not contain any counts")
+    return values
+
+
+def _get_pp_layer_ranges(num_layers: int, pp_size: int) -> List[Tuple[int, int]]:
+    from sglang.srt.distributed import get_pp_indices
+
+    return [get_pp_indices(num_layers, pp_rank, pp_size) for pp_rank in range(pp_size)]
+
+
+def _infer_pp_size_for_kt_layer_budgets() -> int:
+    partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION")
+    if partition_list_str:
+        return len([p for p in partition_list_str.split(",") if p.strip()])
+
+    try:
+        from sglang.srt.distributed import get_pp_group
+
+        return get_pp_group().world_size
+    except Exception:
+        return 1
+
+
+def _resolve_kt_gpu_expert_layer_counts(
+    num_layers: int,
+    num_experts: int,
+    first_k_dense_replace: int,
+    moe_layer_freq: int,
+) -> Optional[List[int]]:
+    """Return explicit per-layer GPU expert counts from env, if configured.
+
+    These envs are intentionally outside ServerArgs so we can tune asymmetric
+    local deployments without adding another public serving flag. They only
+    change the initial GPU expert mask; dynamic expert update still keeps each
+    layer's current slot count by reading mask.sum() from the layer wrapper.
+    """
+
+    by_layer = _parse_int_env_list("SGLANG_KT_NUM_GPU_EXPERTS_BY_LAYER")
+    by_pp = _parse_int_env_list("SGLANG_KT_NUM_GPU_EXPERTS_BY_PP")
+
+    if by_layer is not None and by_pp is not None:
+        raise ValueError(
+            "Set only one of SGLANG_KT_NUM_GPU_EXPERTS_BY_LAYER or "
+            "SGLANG_KT_NUM_GPU_EXPERTS_BY_PP"
+        )
+    if by_layer is None and by_pp is None:
+        return None
+
+    moe_layers = _moe_layer_indices(
+        num_layers, first_k_dense_replace, moe_layer_freq
+    )
+    counts = [num_experts] * num_layers
+
+    if by_layer is not None:
+        if len(by_layer) == num_layers:
+            for layer_idx, count in enumerate(by_layer):
+                counts[layer_idx] = min(count, num_experts)
+        elif len(by_layer) == len(moe_layers):
+            for layer_idx, count in zip(moe_layers, by_layer):
+                counts[layer_idx] = min(count, num_experts)
+        else:
+            raise ValueError(
+                "SGLANG_KT_NUM_GPU_EXPERTS_BY_LAYER must have either "
+                f"{num_layers} entries (one per layer) or {len(moe_layers)} "
+                f"entries (one per MoE layer); got {len(by_layer)}"
+            )
+    else:
+        pp_size = _infer_pp_size_for_kt_layer_budgets()
+        if len(by_pp) != pp_size:
+            raise ValueError(
+                "SGLANG_KT_NUM_GPU_EXPERTS_BY_PP entry count must match PP "
+                f"world size ({pp_size}); got {len(by_pp)}"
+            )
+        for pp_rank, (start_layer, end_layer) in enumerate(
+            _get_pp_layer_ranges(num_layers, pp_size)
+        ):
+            pp_count = min(by_pp[pp_rank], num_experts)
+            for layer_idx in range(start_layer, end_layer):
+                counts[layer_idx] = pp_count
+
+    return counts
+
+
+def generate_layer_count_masks(
+    num_layers: int,
+    num_experts: int,
+    per_layer_gpu_experts: Sequence[int],
+    first_k_dense_replace: int,
+    moe_layer_freq: int,
+    *,
+    activation_freq: Optional[torch.Tensor] = None,
+    random_seed: Optional[int] = None,
+) -> torch.Tensor:
+    """Generate masks from explicit per-layer GPU expert counts."""
+
+    if len(per_layer_gpu_experts) != num_layers:
+        raise ValueError(
+            f"Expected {num_layers} per-layer expert counts, "
+            f"got {len(per_layer_gpu_experts)}"
+        )
+
+    masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
+    rng = None
+    if random_seed is not None:
+        rng = torch.Generator(device="cpu")
+        rng.manual_seed(random_seed)
+
+    for layer_idx in _moe_layer_indices(
+        num_layers, first_k_dense_replace, moe_layer_freq
+    ):
+        num_for_this_layer = min(
+            max(int(per_layer_gpu_experts[layer_idx]), 0), num_experts
+        )
+        if num_for_this_layer <= 0:
+            continue
+
+        if activation_freq is not None:
+            selected = torch.argsort(
+                activation_freq[layer_idx], descending=True, stable=True
+            )[:num_for_this_layer]
+        elif rng is not None:
+            selected = torch.randperm(num_experts, generator=rng, device="cpu")[
+                :num_for_this_layer
+            ]
+        else:
+            selected = torch.arange(num_for_this_layer, device="cpu")
+        masks[layer_idx, selected] = True
+
+    _set_non_moe_layers_to_gpu(masks, first_k_dense_replace, moe_layer_freq)
+    return masks
+
+
 def generate_random_masks(
     num_layers: int,
     num_experts: int,
@@ -1712,14 +1911,36 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         moe_layer_freq = 1
 
     # Count actual MoE layers
-    num_moe_layers = sum(
-        1 for i in range(num_layers)
-        if i >= first_k_dense_replace and i % moe_layer_freq == 0
+    moe_layers = _moe_layer_indices(
+        num_layers, first_k_dense_replace, moe_layer_freq
     )
+    num_moe_layers = len(moe_layers)
     total_experts = num_moe_layers * num_experts
+    explicit_layer_gpu_experts = _resolve_kt_gpu_expert_layer_counts(
+        num_layers, num_experts, first_k_dense_replace, moe_layer_freq
+    )
 
     # Determine num_gpu_experts (total across all layers)
-    if server_args.kt_gpu_experts_ratio is not None:
+    if explicit_layer_gpu_experts is not None:
+        num_gpu_experts = sum(explicit_layer_gpu_experts[i] for i in moe_layers)
+        logger.info(
+            "Using explicit KT per-layer GPU expert budgets from env, "
+            "total GPU experts: %d (= %d MoE layers with counts %s)",
+            num_gpu_experts,
+            num_moe_layers,
+            sorted({explicit_layer_gpu_experts[i] for i in moe_layers}),
+        )
+        if (
+            server_args.kt_gpu_experts_ratio is not None
+            or server_args.kt_num_gpu_experts is not None
+        ):
+            logger.warning(
+                "Explicit KT per-layer GPU expert budgets override "
+                "--kt-gpu-experts-ratio=%s and --kt-num-gpu-experts=%s",
+                server_args.kt_gpu_experts_ratio,
+                server_args.kt_num_gpu_experts,
+            )
+    elif server_args.kt_gpu_experts_ratio is not None:
         # Use ratio to calculate total GPU experts
         num_gpu_experts = int(total_experts * server_args.kt_gpu_experts_ratio)
         if server_args.kt_num_gpu_experts is not None:
@@ -1807,7 +2028,20 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
 
         # Generate masks on rank 0
         if tp_rank == 0:
-            if strategy == "frequency":
+            if explicit_layer_gpu_experts is not None:
+                logger.info(
+                    "Using %s strategy with explicit per-layer GPU expert budgets",
+                    strategy,
+                )
+                masks = generate_layer_count_masks(
+                    num_layers,
+                    num_experts,
+                    explicit_layer_gpu_experts,
+                    first_k_dense_replace,
+                    moe_layer_freq,
+                    activation_freq=activation_freq,
+                )
+            elif strategy == "frequency":
                 masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts)
             else:
                 masks = generate_frequency_uniform_masks(
@@ -1826,30 +2060,62 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     elif strategy == "front-loading":
         if tp_rank == 0:
             logger.info("Using front-loading strategy for GPU expert placement")
-            masks = generate_front_loading_masks(
-                num_layers, num_experts, num_gpu_experts,
-                first_k_dense_replace, moe_layer_freq
-            )
+            if explicit_layer_gpu_experts is not None:
+                logger.info(
+                    "Explicit per-layer KT budgets override front-loading "
+                    "layer fill order"
+                )
+                masks = generate_layer_count_masks(
+                    num_layers,
+                    num_experts,
+                    explicit_layer_gpu_experts,
+                    first_k_dense_replace,
+                    moe_layer_freq,
+                )
+            else:
+                masks = generate_front_loading_masks(
+                    num_layers, num_experts, num_gpu_experts,
+                    first_k_dense_replace, moe_layer_freq
+                )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
 
     elif strategy == "uniform":
         if tp_rank == 0:
             logger.info("Using uniform strategy for GPU expert placement")
-            masks = generate_uniform_masks(
-                num_layers, num_experts, num_gpu_experts,
-                first_k_dense_replace, moe_layer_freq
-            )
+            if explicit_layer_gpu_experts is not None:
+                masks = generate_layer_count_masks(
+                    num_layers,
+                    num_experts,
+                    explicit_layer_gpu_experts,
+                    first_k_dense_replace,
+                    moe_layer_freq,
+                )
+            else:
+                masks = generate_uniform_masks(
+                    num_layers, num_experts, num_gpu_experts,
+                    first_k_dense_replace, moe_layer_freq
+                )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
 
     elif strategy == "random":
         if tp_rank == 0:
             logger.info("Using random strategy for GPU expert placement (seed=42)")
-            masks = generate_random_masks(
-                num_layers, num_experts, num_gpu_experts,
-                first_k_dense_replace, moe_layer_freq, seed=42
-            )
+            if explicit_layer_gpu_experts is not None:
+                masks = generate_layer_count_masks(
+                    num_layers,
+                    num_experts,
+                    explicit_layer_gpu_experts,
+                    first_k_dense_replace,
+                    moe_layer_freq,
+                    random_seed=42,
+                )
+            else:
+                masks = generate_random_masks(
+                    num_layers, num_experts, num_gpu_experts,
+                    first_k_dense_replace, moe_layer_freq, seed=42
+                )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
 
@@ -2686,6 +2952,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             Combined computation results from CPU and GPU experts
         """
+        global _KT_FULL_GPU_FALLBACK_DISABLED, _SHARED_FULL_CONTEXT
+
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
@@ -2708,65 +2976,118 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             tokens=num_tokens,
             threshold=self.gpu_prefill_token_threshold,
             full_gpu=(
-                self.gpu_prefill_token_threshold > 0
+                not _KT_FULL_GPU_FALLBACK_DISABLED
+                and self.gpu_prefill_token_threshold > 0
                 and num_tokens >= self.gpu_prefill_token_threshold
             ),
         )
 
         # Check for full GPU fallback
         if (
-            self.gpu_prefill_token_threshold > 0
+            not _KT_FULL_GPU_FALLBACK_DISABLED
+            and self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
         ):
-            ctx = self._build_full_context(layer)
-
-            t_compute = time.perf_counter()
-            result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            compute_time = (time.perf_counter() - t_compute) * 1000.0
-            _kt_log_timing(
-                self,
-                "kt.full_gpu.compute",
-                tokens=num_tokens,
-                elapsed_ms=f"{compute_time:.3f}",
-            )
-
-            # Dynamic expert update: analyze batch and update GPU experts
-            if self.kt_config.kt_enable_dynamic_expert_update:
-                t_update = time.perf_counter()
-                self._update_gpu_experts_from_batch(
-                    layer=layer,
-                    ctx=ctx,
-                    dispatch_output=dispatch_output,
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                update_time = (time.perf_counter() - t_update) * 1000.0
+            min_free_bytes = _kt_full_gpu_fallback_min_free_bytes()
+            free_bytes = None
+            if min_free_bytes > 0 and torch.cuda.is_available():
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info(x.device)
+                except Exception:
+                    free_bytes = None
+            if free_bytes is not None and free_bytes < min_free_bytes:
+                _KT_FULL_GPU_FALLBACK_DISABLED = True
+                self.gpu_prefill_token_threshold = 0
                 _kt_log_timing(
                     self,
-                    "kt.dynamic_update",
+                    "kt.full_gpu.low_mem_disable",
                     tokens=num_tokens,
-                    elapsed_ms=f"{update_time:.3f}",
+                    free_mb=f"{free_bytes / 1024**2:.1f}",
+                    min_free_mb=f"{min_free_bytes / 1024**2:.1f}",
                 )
-
                 if self._is_kt_active_rank:
-                    logger.info(
-                        "KT layerwise prefill: layer %d compute = %.2f ms, expert update = %.2f ms",
+                    logger.warning(
+                        "KT full-GPU prefill fallback disabled before layer %d: "
+                        "free GPU memory %.1f MiB is below %.1f MiB. "
+                        "Continuing with hybrid CPU/GPU experts.",
                         self.kt_config.layer_idx,
-                        compute_time,
-                        update_time,
+                        free_bytes / 1024**2,
+                        min_free_bytes / 1024**2,
                     )
             else:
-                if self._is_kt_active_rank:
-                    logger.info(
-                        "KT layerwise prefill: layer %d compute = %.2f ms",
-                        self.kt_config.layer_idx,
-                        compute_time,
+                try:
+                    ctx = self._build_full_context(layer)
+
+                    t_compute = time.perf_counter()
+                    result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    compute_time = (time.perf_counter() - t_compute) * 1000.0
+                    _kt_log_timing(
+                        self,
+                        "kt.full_gpu.compute",
+                        tokens=num_tokens,
+                        elapsed_ms=f"{compute_time:.3f}",
                     )
 
-            return result
+                    # Dynamic expert update: analyze batch and update GPU experts
+                    if self.kt_config.kt_enable_dynamic_expert_update:
+                        t_update = time.perf_counter()
+                        self._update_gpu_experts_from_batch(
+                            layer=layer,
+                            ctx=ctx,
+                            dispatch_output=dispatch_output,
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        update_time = (time.perf_counter() - t_update) * 1000.0
+                        _kt_log_timing(
+                            self,
+                            "kt.dynamic_update",
+                            tokens=num_tokens,
+                            elapsed_ms=f"{update_time:.3f}",
+                        )
 
+                        if self._is_kt_active_rank:
+                            logger.info(
+                                "KT layerwise prefill: layer %d compute = %.2f ms, expert update = %.2f ms",
+                                self.kt_config.layer_idx,
+                                compute_time,
+                                update_time,
+                            )
+                    else:
+                        if self._is_kt_active_rank:
+                            logger.info(
+                                "KT layerwise prefill: layer %d compute = %.2f ms",
+                                self.kt_config.layer_idx,
+                                compute_time,
+                            )
+
+                    return result
+                except Exception as err:
+                    if not _looks_like_cuda_oom(err):
+                        raise
+                    _KT_FULL_GPU_FALLBACK_DISABLED = True
+                    _SHARED_FULL_CONTEXT = None
+                    self.gpu_prefill_token_threshold = 0
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    _kt_log_timing(
+                        self,
+                        "kt.full_gpu.oom_disable",
+                        tokens=num_tokens,
+                        error=str(err).splitlines()[0],
+                    )
+                    if self._is_kt_active_rank:
+                        logger.warning(
+                            "KT full-GPU prefill fallback disabled after OOM at "
+                            "layer %d with %d tokens and %d resident GPU experts; "
+                            "continuing with hybrid CPU/GPU experts. Error: %s",
+                            self.kt_config.layer_idx,
+                            num_tokens,
+                            self.num_gpu_experts,
+                            str(err).splitlines()[0],
+                        )
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
