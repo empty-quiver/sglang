@@ -243,6 +243,19 @@ def _kt_staging_probe_enabled() -> bool:
     return os.getenv("SGLANG_KT_STAGING_PROBE") in ("1", "true", "TRUE")
 
 
+def _kt_staging_swap_enabled() -> bool:
+    return os.getenv("SGLANG_KT_STAGING_SWAP") in ("1", "true", "TRUE")
+
+
+def _kt_staging_swap_limit() -> int:
+    raw = os.getenv("SGLANG_KT_STAGING_SWAP_LIMIT", "1")
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid SGLANG_KT_STAGING_SWAP_LIMIT=%r; using 1", raw)
+        return 1
+
+
 def _parse_int_set(raw: Optional[str]) -> Optional[set]:
     if raw is None or not raw.strip():
         return None
@@ -342,6 +355,9 @@ def finish_kt_staging_probe(probe: Optional[dict]) -> None:
         total_ms=f"{total_ms:.3f}",
         copy_ms=f"{copy_ms:.3f}" if copy_ms is not None else None,
     )
+    method = probe.get("method")
+    if method is not None:
+        method._kt_staging_probe_maybe_swap(probe)
 
 
 class SharedStagingBuffer:
@@ -2806,6 +2822,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._kt_staging_probe_pending: Optional[dict] = None
         self._kt_staging_probe_cursor: int = 0
         self._kt_staging_probe_warned: bool = False
+        self._kt_staging_probe_swaps: int = 0
 
     def create_weights(
         self,
@@ -3040,6 +3057,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             "pinned": pinned,
             "total_bytes": total_bytes,
             "next_slot": 0,
+            "swap_cursor": 0,
         }
         self._kt_staging_probe_state = state
         _kt_staging_probe_log(
@@ -3151,6 +3169,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "expert": pending["expert"],
                 "slot": slot,
                 "bytes": pending["bytes"],
+                "method": self,
             }
             _kt_staging_probe_log(
                 "h2d_start",
@@ -3178,6 +3197,139 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
 
         return probe
+
+    def _kt_staging_probe_configured_evicts(self) -> Optional[List[int]]:
+        raw = os.getenv("SGLANG_KT_STAGING_SWAP_EVICTS")
+        if not raw:
+            return None
+        layer_prefix = f"{self.kt_config.layer_idx}:"
+        for spec in raw.split(";"):
+            spec = spec.strip()
+            if not spec or not spec.startswith(layer_prefix):
+                continue
+            ids = spec[len(layer_prefix) :]
+            out = []
+            for item in ids.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                out.append(int(item))
+            return out or None
+        return None
+
+    def _kt_staging_probe_choose_evict(
+        self, staged_expert: int, state: dict
+    ) -> Optional[Tuple[int, int]]:
+        configured = self._kt_staging_probe_configured_evicts()
+        if configured is not None:
+            for logical_id in configured:
+                if logical_id == staged_expert:
+                    continue
+                if 0 <= logical_id < int(self.gpu_experts_mask.numel()):
+                    gpu_idx = int(self.logical_to_gpu_index[int(logical_id)].item())
+                    if gpu_idx >= 0:
+                        return int(logical_id), gpu_idx
+            return None
+
+        num_slots = int(self.num_gpu_experts)
+        if num_slots <= 0:
+            return None
+        for _ in range(num_slots):
+            gpu_idx = int(state["swap_cursor"] % num_slots)
+            state["swap_cursor"] += 1
+            logical_id = int(self.gpu_index_to_logical[gpu_idx].item())
+            if logical_id >= 0 and logical_id != staged_expert:
+                return logical_id, gpu_idx
+        return None
+
+    def _kt_staging_probe_maybe_swap(self, probe: dict) -> None:
+        if not _kt_staging_swap_enabled():
+            return
+        limit = _kt_staging_swap_limit()
+        if limit > 0 and self._kt_staging_probe_swaps >= limit:
+            return
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                _kt_staging_probe_log(
+                    "swap_skip_capture",
+                    layer=self.kt_config.layer_idx,
+                    expert=probe["expert"],
+                )
+                return
+        except Exception:
+            return
+
+        state = self._kt_staging_probe_state
+        layer = self._kt_staging_probe_layer
+        names = self._kt_staging_probe_weight_names()
+        if state is None or layer is None or names is None:
+            return
+
+        staged_expert = int(probe["expert"])
+        if bool(self.gpu_experts_mask[staged_expert].item()):
+            _kt_staging_probe_log(
+                "swap_skip_resident",
+                layer=self.kt_config.layer_idx,
+                expert=staged_expert,
+            )
+            return
+
+        evict = self._kt_staging_probe_choose_evict(staged_expert, state)
+        if evict is None:
+            _kt_staging_probe_log(
+                "swap_skip_no_evict",
+                layer=self.kt_config.layer_idx,
+                expert=staged_expert,
+            )
+            return
+
+        evicted_expert, gpu_idx = evict
+        t_swap = time.perf_counter()
+        current_stream = torch.cuda.current_stream(self._kt_staging_probe_device)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(current_stream)
+        for name in names:
+            dst_weight = getattr(layer, name)
+            dst_weight[gpu_idx].copy_(
+                state["gpu_scratch"][name][probe["slot"]],
+                non_blocking=True,
+            )
+        end_event.record(current_stream)
+        end_event.synchronize()
+        try:
+            weight_copy_ms = start_event.elapsed_time(end_event)
+        except Exception:
+            weight_copy_ms = None
+
+        self.gpu_experts_mask[evicted_expert] = False
+        self.gpu_experts_mask[staged_expert] = True
+        self.logical_to_gpu_index[evicted_expert] = -1
+        self.logical_to_gpu_index[staged_expert] = int(gpu_idx)
+        self.gpu_index_to_logical[gpu_idx] = int(staged_expert)
+        self.kt_config.gpu_experts_mask = self.gpu_experts_mask
+        self.gpu_experts_mask_cuda.copy_(
+            self.gpu_experts_mask.to(device=self._kt_staging_probe_device)
+        )
+        self.logical_to_gpu_index_cuda.copy_(
+            self.logical_to_gpu_index.to(device=self._kt_staging_probe_device)
+        )
+        if self._is_kt_active_rank:
+            update_kt_wrapper_masks(self.wrapper, self.gpu_experts_mask)
+
+        self._kt_staging_probe_swaps += 1
+        _kt_staging_probe_log(
+            "swap",
+            layer=self.kt_config.layer_idx,
+            expert=staged_expert,
+            evicted=evicted_expert,
+            gpu_idx=gpu_idx,
+            swaps=self._kt_staging_probe_swaps,
+            weight_copy_ms=(
+                f"{weight_copy_ms:.3f}" if weight_copy_ms is not None else None
+            ),
+            elapsed_ms=f"{(time.perf_counter() - t_swap) * 1000.0:.3f}",
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
