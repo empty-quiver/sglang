@@ -492,7 +492,14 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                if self.server_args.pp_async_batch_depth > 0:
+                dflash_defer_prelaunch_output = (
+                    self.server_args.pp_async_batch_depth > 0
+                    and self._pp_dflash_run_control_enabled()
+                )
+                if (
+                    self.server_args.pp_async_batch_depth > 0
+                    and not dflash_defer_prelaunch_output
+                ):
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -568,7 +575,10 @@ class SchedulerPPMixin:
                                 flush=True,
                             )
 
-                if self.server_args.pp_async_batch_depth == 0:
+                if (
+                    self.server_args.pp_async_batch_depth == 0
+                    or dflash_defer_prelaunch_output
+                ):
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
