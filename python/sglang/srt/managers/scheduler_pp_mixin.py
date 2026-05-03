@@ -80,6 +80,8 @@ _DFLASH_ROUTE_TIMING_PHASES = {
     "pp.output_ring.result_drain",
     "pp.output_ring.forward_drain",
     "pp.output_intent.arbitrate",
+    "pp.coalesce.clear_stale_full",
+    "pp.coalesce.follower_clear_stale_full",
     "pp.coalesce.skip",
     "pp.coalesce.owner",
     "pp.proxy.recv.defer",
@@ -93,6 +95,8 @@ _DFLASH_ROUTE_TIMING_EMPTY_PHASES = {
     "pp.output_ring.result_drain",
     "pp.output_ring.forward_drain",
     "pp.output_intent.arbitrate",
+    "pp.coalesce.clear_stale_full",
+    "pp.coalesce.follower_clear_stale_full",
     "pp.coalesce.skip",
     "pp.coalesce.owner",
     "pp.idle.defer",
@@ -1338,6 +1342,7 @@ class SchedulerPPMixin:
         if self._pp_dflash_pipeline_slots_enabled():
             return False
         if len(self.waiting_queue) == 0:
+            self.dflash_pp_stale_full_coalesce_retry_key = None
             return False
 
         current = self.running_mbs[mb_id]
@@ -1397,8 +1402,13 @@ class SchedulerPPMixin:
         for other_id, other in enumerate(self.running_mbs):
             if other_id == mb_id or other is None or other.is_empty():
                 continue
-            if other.batch_size() >= max_bs or other.batch_is_full:
+            if other.batch_size() >= max_bs:
                 continue
+            if other.batch_is_full:
+                if not self._pp_dflash_try_clear_stale_full_for_coalesce(
+                    other_id, other
+                ):
+                    continue
             if (
                 other.spec_algorithm is not None
                 and other.spec_algorithm.is_dflash()
@@ -1426,6 +1436,58 @@ class SchedulerPPMixin:
                 )
                 return True
         return False
+
+    def _pp_dflash_try_clear_stale_full_for_coalesce(
+        self: Scheduler, other_id: int, other: ScheduleBatch
+    ) -> bool:
+        """Give a not-full DFlash slot one chance to accept waiting requests.
+
+        Chunked prefill can leave ``batch_is_full`` set on a route after a
+        chunk-boundary budget stop, even though the route has fewer requests
+        than ``pp_max_micro_batch_size`` and the next waiting request is now a
+        small cached suffix. If an empty PP slot consumes that suffix, the
+        decode cohort splits into e.g. bs=3 plus bs=1. Clearing the hint once
+        lets the active route try to absorb the suffix; if it is genuinely full,
+        the normal prefill path will set the hint again and this helper will not
+        retry the same waiting/active shape.
+        """
+        if not _dflash_env_enabled("SGLANG_DFLASH_PP_CLEAR_STALE_FULL_COALESCE"):
+            return False
+
+        max_bs = self.server_args.pp_max_micro_batch_size
+        if max_bs is None or other.batch_size() >= max_bs:
+            return False
+        if self.get_num_allocatable_reqs(other.batch_size()) <= 0:
+            return False
+
+        waiting_hashes = tuple(
+            _dflash_stable_rid_hash(req.rid) for req in self.waiting_queue[:max_bs]
+        )
+        active_hashes = tuple(_dflash_batch_rid_hashes(other))
+        retry_key = (int(other_id), active_hashes, waiting_hashes)
+        if getattr(self, "dflash_pp_stale_full_coalesce_retry_key", None) == retry_key:
+            return False
+
+        self.dflash_pp_stale_full_coalesce_retry_key = retry_key
+        other.batch_is_full = False
+        if _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE"):
+            logger.info(
+                "DFLASH PP coalesce cleared stale batch_is_full PP%d "
+                "target_mb=%d target_bs=%d waiting=%d",
+                self.pp_rank,
+                other_id,
+                other.batch_size(),
+                len(self.waiting_queue),
+            )
+        _dflash_log_timeline(
+            self,
+            "pp.coalesce.clear_stale_full",
+            mb_id=other_id,
+            batch=other,
+            waiting=len(self.waiting_queue),
+            target_bs=max_bs,
+        )
+        return True
 
     def _pp_dflash_run_control_enabled(self: Scheduler) -> bool:
         return (
@@ -1536,12 +1598,63 @@ class SchedulerPPMixin:
         if not bool(control["run"]):
             self._pp_dflash_cleanup_follower_idle_slot(mb_id)
             return None
+        self._pp_dflash_prepare_follower_for_run_control(mb_id, control)
         if self._pp_should_skip_slot_for_dflash_coalesce(mb_id):
             raise RuntimeError(
                 "DFLASH PP follower attempted a local coalesce skip for an "
                 f"authoritative RUN slot: mb={mb_id}, control={control}."
             )
         return self.get_next_batch_to_run()
+
+    def _pp_dflash_prepare_follower_for_run_control(
+        self: Scheduler, mb_id: int, control: Dict[str, object]
+    ) -> None:
+        """Mirror safe PP0 scheduling hints before follower local selection."""
+        if not _dflash_env_enabled("SGLANG_DFLASH_PP_CLEAR_STALE_FULL_COALESCE"):
+            return
+        if self.pp_group.is_first_rank:
+            return
+        if int(control.get("forward_mode", -1)) != int(ForwardMode.EXTEND):
+            return
+
+        current = self.running_batch
+        if current is None or current.is_empty() or not current.batch_is_full:
+            return
+
+        max_bs = self.server_args.pp_max_micro_batch_size
+        if max_bs is None or current.batch_size() >= max_bs:
+            return
+        if len(self.waiting_queue) == 0:
+            return
+        if self.get_num_allocatable_reqs(current.batch_size()) <= 0:
+            return
+
+        control_hashes = tuple(control.get("rid_hashes", ()))
+        waiting_hashes = tuple(
+            _dflash_stable_rid_hash(req.rid) for req in self.waiting_queue[:max_bs]
+        )
+        if not control_hashes or not set(control_hashes).issubset(set(waiting_hashes)):
+            return
+
+        current.batch_is_full = False
+        if _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE"):
+            logger.info(
+                "DFLASH PP follower cleared stale batch_is_full PP%d "
+                "mb=%d current_bs=%d waiting=%d control_bs=%d",
+                self.pp_rank,
+                mb_id,
+                current.batch_size(),
+                len(self.waiting_queue),
+                int(control.get("batch_size", 0)),
+            )
+        _dflash_log_timeline(
+            self,
+            "pp.coalesce.follower_clear_stale_full",
+            mb_id=mb_id,
+            batch=current,
+            waiting=len(self.waiting_queue),
+            control=control,
+        )
 
     def _pp_dflash_cleanup_follower_idle_slot(self: Scheduler, mb_id: int) -> None:
         current = self.running_batch
