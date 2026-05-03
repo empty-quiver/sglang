@@ -80,6 +80,7 @@ _DFLASH_ROUTE_TIMING_PHASES = {
     "pp.output_intent.arbitrate",
     "pp.coalesce.skip",
     "pp.coalesce.owner",
+    "pp.proxy.recv.defer",
 }
 
 _DFLASH_ROUTE_TIMING_EMPTY_PHASES = {
@@ -448,6 +449,15 @@ class SchedulerPPMixin:
                         _dflash_running_mbs_summary(self.running_mbs),
                         len(self.waiting_queue),
                     )
+                dflash_async_output_prelaunch = (
+                    self._pp_dflash_async_output_prelaunch_enabled()
+                )
+                dflash_defer_current_proxy_recv = (
+                    dflash_async_output_prelaunch
+                    and self.cur_batch is not None
+                    and not self.pp_group.is_first_rank
+                )
+                pp_proxy_tensors = None
                 if self.cur_batch:
                     dflash_debug = os.getenv("SGLANG_DFLASH_DEBUG") in (
                         "1",
@@ -468,49 +478,60 @@ class SchedulerPPMixin:
                             f"mb_id={mb_id} about to _pp_recv_proxy_tensors()",
                             flush=True,
                         )
-                    phase_t = time.perf_counter()
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                    _dflash_log_timeline(
-                        self,
-                        "pp.proxy.recv",
-                        mb_id=mb_id,
-                        batch=self.cur_batch,
-                        start_time=phase_t,
-                        proxy_keys=(
-                            list(pp_proxy_tensors.tensors.keys())
-                            if pp_proxy_tensors is not None
-                            else None
-                        ),
-                    )
-                    if dflash_debug:
-                        print(
-                            f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
-                            f"mb_id={mb_id} _pp_recv_proxy_tensors() DONE keys="
-                            f"{list(pp_proxy_tensors.tensors.keys()) if pp_proxy_tensors else None}",
-                            flush=True,
+                    if not dflash_defer_current_proxy_recv:
+                        phase_t = time.perf_counter()
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        _dflash_log_timeline(
+                            self,
+                            "pp.proxy.recv",
+                            mb_id=mb_id,
+                            batch=self.cur_batch,
+                            start_time=phase_t,
+                            proxy_keys=(
+                                list(pp_proxy_tensors.tensors.keys())
+                                if pp_proxy_tensors is not None
+                                else None
+                            ),
                         )
-                    if (
-                        os.getenv("SGLANG_DFLASH_PP_PROXY_PROBE") in ("1", "true", "TRUE")
-                        and pp_proxy_tensors is not None
-                        and self.cur_batch.spec_algorithm.is_dflash()
-                        and self.cur_batch.forward_mode.is_decode()
-                    ):
-                        hidden = pp_proxy_tensors.tensors.get("hidden_states", None)
-                        if hidden is not None and hidden.numel() > 0:
-                            rows = hidden[: min(int(hidden.shape[0]), 4)].float()
-                            logger.info(
-                                "DFLASH PP%d recv proxy hidden shape=%s row_sums=%s row_norms=%s",
-                                self.pp_rank,
-                                tuple(hidden.shape),
-                                rows.sum(dim=1).detach().cpu().tolist(),
-                                rows.norm(dim=1).detach().cpu().tolist(),
+                        if dflash_debug:
+                            print(
+                                f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
+                                f"mb_id={mb_id} _pp_recv_proxy_tensors() DONE keys="
+                                f"{list(pp_proxy_tensors.tensors.keys()) if pp_proxy_tensors else None}",
+                                flush=True,
                             )
+                        if (
+                            os.getenv("SGLANG_DFLASH_PP_PROXY_PROBE")
+                            in ("1", "true", "TRUE")
+                            and pp_proxy_tensors is not None
+                            and self.cur_batch.spec_algorithm.is_dflash()
+                            and self.cur_batch.forward_mode.is_decode()
+                        ):
+                            hidden = pp_proxy_tensors.tensors.get("hidden_states", None)
+                            if hidden is not None and hidden.numel() > 0:
+                                rows = hidden[: min(int(hidden.shape[0]), 4)].float()
+                                logger.info(
+                                    "DFLASH PP%d recv proxy hidden shape=%s row_sums=%s row_norms=%s",
+                                    self.pp_rank,
+                                    tuple(hidden.shape),
+                                    rows.sum(dim=1).detach().cpu().tolist(),
+                                    rows.norm(dim=1).detach().cpu().tolist(),
+                                )
+                    else:
+                        _dflash_log_timeline(
+                            self,
+                            "pp.proxy.recv.defer",
+                            mb_id=mb_id,
+                            batch=self.cur_batch,
+                            reason="dflash_async_output_prelaunch",
+                        )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
                 dflash_defer_prelaunch_output = (
                     self.server_args.pp_async_batch_depth > 0
                     and self._pp_dflash_run_control_enabled()
+                    and not dflash_async_output_prelaunch
                 )
                 if (
                     self.server_args.pp_async_batch_depth > 0
@@ -530,6 +551,39 @@ class SchedulerPPMixin:
                     mb_id=mb_id,
                     start_time=phase_t,
                 )
+                if dflash_defer_current_proxy_recv:
+                    phase_t = time.perf_counter()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    _dflash_log_timeline(
+                        self,
+                        "pp.proxy.recv",
+                        mb_id=mb_id,
+                        batch=self.cur_batch,
+                        start_time=phase_t,
+                        deferred=True,
+                        proxy_keys=(
+                            list(pp_proxy_tensors.tensors.keys())
+                            if pp_proxy_tensors is not None
+                            else None
+                        ),
+                    )
+                    if (
+                        os.getenv("SGLANG_DFLASH_PP_PROXY_PROBE")
+                        in ("1", "true", "TRUE")
+                        and pp_proxy_tensors is not None
+                        and self.cur_batch.spec_algorithm.is_dflash()
+                        and self.cur_batch.forward_mode.is_decode()
+                    ):
+                        hidden = pp_proxy_tensors.tensors.get("hidden_states", None)
+                        if hidden is not None and hidden.numel() > 0:
+                            rows = hidden[: min(int(hidden.shape[0]), 4)].float()
+                            logger.info(
+                                "DFLASH PP%d recv proxy hidden shape=%s row_sums=%s row_norms=%s",
+                                self.pp_rank,
+                                tuple(hidden.shape),
+                                rows.sum(dim=1).detach().cpu().tolist(),
+                                rows.norm(dim=1).detach().cpu().tolist(),
+                            )
                 if self.cur_batch:
                     if dflash_debug:
                         print(
@@ -1074,6 +1128,25 @@ class SchedulerPPMixin:
     def _pp_dflash_pipeline_slots_enabled(self: Scheduler) -> bool:
         return self._pp_dflash_run_control_enabled() and _dflash_env_enabled(
             "SGLANG_DFLASH_PP_PIPELINE_SLOTS"
+        )
+
+    def _pp_dflash_async_output_prelaunch_enabled(self: Scheduler) -> bool:
+        """Allow async-depth output drain before current DFlash PP proxy recv.
+
+        In PP=2, the previous DFlash async-depth ordering deadlocked because
+        rank 0 waited for rank 1's output intent while rank 1 was already
+        waiting for rank 0's current-route proxy tensors. This opt-in keeps the
+        output-intent prelaunch ordering but delays the follower's current proxy
+        receive until after that intent exchange. Default behavior stays on the
+        conservative post-launch drain path. Keep this disabled for separate
+        pipeline slots until their request/KV lifecycle is fixed.
+        """
+        return (
+            self.server_args.pp_async_batch_depth > 0
+            and self.pp_size == 2
+            and self._pp_dflash_run_control_enabled()
+            and not self._pp_dflash_pipeline_slots_enabled()
+            and _dflash_env_enabled("SGLANG_DFLASH_PP_ASYNC_OUTPUT_PRELAUNCH")
         )
 
     def _pp_dflash_sticky_chunked_prefill_enabled(self: Scheduler) -> bool:
