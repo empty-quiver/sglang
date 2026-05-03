@@ -271,6 +271,160 @@ def _dflash_run_batch_timing_enabled() -> bool:
     return os.getenv("SGLANG_DFLASH_RUN_BATCH_TIMING") in ("1", "true", "TRUE")
 
 
+def _dflash_h2d_overlap_probe_enabled() -> bool:
+    return os.getenv("SGLANG_DFLASH_H2D_OVERLAP_PROBE") in ("1", "true", "TRUE")
+
+
+def _dflash_h2d_overlap_probe_mb() -> int:
+    raw = os.getenv("SGLANG_DFLASH_H2D_OVERLAP_PROBE_MB", "64")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_DFLASH_H2D_OVERLAP_PROBE_MB=%r; using 64", raw
+        )
+        return 64
+
+
+def _dflash_h2d_overlap_probe_rank_matches(scheduler) -> bool:
+    raw = os.getenv("SGLANG_DFLASH_H2D_OVERLAP_PROBE_RANK", "last").strip().lower()
+    if raw in ("all", "*"):
+        return True
+    if raw == "last":
+        return bool(getattr(scheduler.pp_group, "is_last_rank", False))
+    if raw == "first":
+        return bool(getattr(scheduler.pp_group, "is_first_rank", False))
+    try:
+        return int(raw) == int(getattr(scheduler, "pp_rank", -1))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_DFLASH_H2D_OVERLAP_PROBE_RANK=%r; using last", raw
+        )
+        return bool(getattr(scheduler.pp_group, "is_last_rank", False))
+
+
+def _log_dflash_h2d_overlap_probe(scheduler, phase: str, **fields) -> None:
+    if not _dflash_h2d_overlap_probe_enabled():
+        return
+    parts = [
+        f"phase={phase}",
+        f"pp={getattr(scheduler, 'pp_rank', None)}",
+        f"rank_is_last={getattr(scheduler.pp_group, 'is_last_rank', None)}",
+    ]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    logger.info("DFLASH H2D overlap probe %s", " ".join(parts))
+
+
+def _maybe_start_dflash_h2d_overlap_probe(
+    scheduler, batch: Optional[ScheduleBatch]
+) -> Optional[dict]:
+    if not _dflash_h2d_overlap_probe_enabled():
+        return None
+    if (
+        batch is None
+        or not getattr(scheduler, "enable_overlap", False)
+        or getattr(scheduler, "pp_size", 1) <= 1
+        or getattr(scheduler, "spec_algorithm", None) is None
+        or not scheduler.spec_algorithm.is_dflash()
+        or not _dflash_h2d_overlap_probe_rank_matches(scheduler)
+        or not torch.cuda.is_available()
+        or not batch.forward_mode.is_decode()
+    ):
+        return None
+
+    probe_mb = _dflash_h2d_overlap_probe_mb()
+    numel = probe_mb * 1024 * 1024
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = getattr(scheduler, "_dflash_h2d_overlap_probe_state", None)
+    if (
+        state is None
+        or state.get("numel") != numel
+        or state.get("device") != device
+    ):
+        alloc_t = time.perf_counter()
+        try:
+            host = torch.empty((numel,), dtype=torch.uint8, pin_memory=True)
+            pinned = True
+        except Exception as err:
+            host = torch.empty((numel,), dtype=torch.uint8)
+            pinned = False
+            _log_dflash_h2d_overlap_probe(
+                scheduler,
+                "alloc_fallback_unpinned",
+                mb=probe_mb,
+                error=str(err).splitlines()[0],
+            )
+        device_buf = torch.empty((numel,), dtype=torch.uint8, device=device)
+        stream = torch.cuda.Stream(device=device)
+        state = {
+            "numel": numel,
+            "device": device,
+            "host": host,
+            "device_buf": device_buf,
+            "stream": stream,
+            "pinned": pinned,
+        }
+        scheduler._dflash_h2d_overlap_probe_state = state
+        _log_dflash_h2d_overlap_probe(
+            scheduler,
+            "alloc",
+            mb=probe_mb,
+            pinned=pinned,
+            alloc_ms=f"{(time.perf_counter() - alloc_t) * 1000.0:.3f}",
+        )
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    done_event = torch.cuda.Event()
+    start_t = time.perf_counter()
+    with torch.cuda.stream(state["stream"]):
+        start_event.record(state["stream"])
+        state["device_buf"].copy_(state["host"], non_blocking=True)
+        end_event.record(state["stream"])
+        done_event.record(state["stream"])
+    _log_dflash_h2d_overlap_probe(
+        scheduler,
+        "start",
+        mb=probe_mb,
+        bs=batch.batch_size(),
+        mode=batch.forward_mode.name,
+        pinned=state["pinned"],
+    )
+    return {
+        "start_t": start_t,
+        "start_event": start_event,
+        "end_event": end_event,
+        "done_event": done_event,
+        "mb": probe_mb,
+        "bs": batch.batch_size(),
+    }
+
+
+def _finish_dflash_h2d_overlap_probe(scheduler, probe: Optional[dict]) -> None:
+    if probe is None:
+        return
+    wait_t = time.perf_counter()
+    probe["done_event"].synchronize()
+    wait_ms = (time.perf_counter() - wait_t) * 1000.0
+    try:
+        copy_ms = probe["start_event"].elapsed_time(probe["end_event"])
+    except Exception:
+        copy_ms = None
+    total_ms = (time.perf_counter() - probe["start_t"]) * 1000.0
+    hidden_ms = max(0.0, total_ms - wait_ms)
+    _log_dflash_h2d_overlap_probe(
+        scheduler,
+        "finish",
+        mb=probe["mb"],
+        bs=probe["bs"],
+        wait_ms=f"{wait_ms:.3f}",
+        hidden_ms=f"{hidden_ms:.3f}",
+        total_ms=f"{total_ms:.3f}",
+        copy_ms=f"{copy_ms:.3f}" if copy_ms is not None else None,
+    )
+
+
 def _log_dflash_run_batch_timing(
     scheduler,
     phase: str,
@@ -2565,11 +2719,15 @@ class Scheduler(
                         kwargs = {}
                         if self.spec_algorithm.is_dflash() and self.pp_size > 1:
                             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+                        h2d_probe = _maybe_start_dflash_h2d_overlap_probe(
+                            self, batch
+                        )
                         phase_t = time.perf_counter()
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch,
                             **kwargs,
                         )
+                        _finish_dflash_h2d_overlap_probe(self, h2d_probe)
                         _log_dflash_run_batch_timing(
                             self,
                             "scheduler.overlap.worker_forward",
