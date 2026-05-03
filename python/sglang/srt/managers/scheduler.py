@@ -425,6 +425,47 @@ def _finish_dflash_h2d_overlap_probe(scheduler, probe: Optional[dict]) -> None:
     )
 
 
+def _maybe_start_kt_staging_probe(
+    scheduler, batch: Optional[ScheduleBatch]
+) -> Optional[dict]:
+    if (
+        batch is None
+        or not getattr(scheduler, "enable_overlap", False)
+        or getattr(scheduler, "pp_size", 1) <= 1
+        or getattr(scheduler, "spec_algorithm", None) is None
+        or not scheduler.spec_algorithm.is_dflash()
+        or not torch.cuda.is_available()
+        or not batch.forward_mode.is_decode()
+    ):
+        return None
+    try:
+        from sglang.srt.layers.moe.kt_ep_wrapper import run_kt_staging_probe_once
+
+        return run_kt_staging_probe_once(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            batch_size=batch.batch_size(),
+            forward_mode=batch.forward_mode.name,
+        )
+    except Exception as err:
+        logger.warning(
+            "KT staging probe failed to start: %s", str(err).splitlines()[0]
+        )
+        return None
+
+
+def _finish_kt_staging_probe(probe: Optional[dict]) -> None:
+    if probe is None:
+        return
+    try:
+        from sglang.srt.layers.moe.kt_ep_wrapper import finish_kt_staging_probe
+
+        finish_kt_staging_probe(probe)
+    except Exception as err:
+        logger.warning(
+            "KT staging probe failed to finish: %s", str(err).splitlines()[0]
+        )
+
+
 def _log_dflash_run_batch_timing(
     scheduler,
     phase: str,
@@ -2719,6 +2760,9 @@ class Scheduler(
                         kwargs = {}
                         if self.spec_algorithm.is_dflash() and self.pp_size > 1:
                             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+                        kt_staging_probe = _maybe_start_kt_staging_probe(
+                            self, batch
+                        )
                         h2d_probe = _maybe_start_dflash_h2d_overlap_probe(
                             self, batch
                         )
@@ -2728,6 +2772,7 @@ class Scheduler(
                             **kwargs,
                         )
                         _finish_dflash_h2d_overlap_probe(self, h2d_probe)
+                        _finish_kt_staging_probe(kt_staging_probe)
                         _log_dflash_run_batch_timing(
                             self,
                             "scheduler.overlap.worker_forward",

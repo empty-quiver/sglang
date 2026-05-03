@@ -229,6 +229,119 @@ class KTConfig:
 _SHARED_FULL_CONTEXT = None
 _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
 _KT_FULL_GPU_FALLBACK_DISABLED = False
+_KT_STAGING_PROBE_METHODS = []
+_KT_STAGING_PROBE_CURSOR = 0
+_KT_STAGING_PROBE_WEIGHT_NAMES_WNA16 = [
+    "w13_qweight",
+    "w13_scales",
+    "w2_qweight",
+    "w2_scales",
+]
+
+
+def _kt_staging_probe_enabled() -> bool:
+    return os.getenv("SGLANG_KT_STAGING_PROBE") in ("1", "true", "TRUE")
+
+
+def _parse_int_set(raw: Optional[str]) -> Optional[set]:
+    if raw is None or not raw.strip():
+        return None
+    out = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            out.update(range(int(start), int(end) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def _kt_staging_probe_layers() -> Optional[set]:
+    return _parse_int_set(os.getenv("SGLANG_KT_STAGING_PROBE_LAYERS"))
+
+
+def _kt_staging_probe_log(phase: str, **fields) -> None:
+    if not _kt_staging_probe_enabled():
+        return
+    parts = [f"phase={phase}"]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    logger.info("KT staging probe %s", " ".join(parts))
+
+
+def _register_kt_staging_probe_method(method) -> None:
+    if method not in _KT_STAGING_PROBE_METHODS:
+        _KT_STAGING_PROBE_METHODS.append(method)
+
+
+def run_kt_staging_probe_once(
+    device: Optional[torch.device] = None,
+    batch_size: int = 0,
+    forward_mode: str = "",
+) -> Optional[dict]:
+    """Run one non-mutating KT expert staging probe step.
+
+    This is called outside CUDA graph replay by the scheduler. It pipelines one
+    CPU expert write from the previous step into a scratch H2D copy for this
+    step, then submits the next CPU expert write. It never mutates resident
+    expert weights or routing maps.
+    """
+    global _KT_STAGING_PROBE_CURSOR
+
+    if not _kt_staging_probe_enabled() or not torch.cuda.is_available():
+        return None
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+    except Exception:
+        return None
+
+    wanted_layers = _kt_staging_probe_layers()
+    eligible = []
+    for method in _KT_STAGING_PROBE_METHODS:
+        if wanted_layers is not None and method.kt_config.layer_idx not in wanted_layers:
+            continue
+        if method._kt_staging_probe_is_eligible(device):
+            eligible.append(method)
+
+    if not eligible:
+        _kt_staging_probe_log("no_eligible_method", forward_mode=forward_mode)
+        return None
+
+    method = eligible[_KT_STAGING_PROBE_CURSOR % len(eligible)]
+    _KT_STAGING_PROBE_CURSOR += 1
+    return method._kt_staging_probe_step(
+        batch_size=batch_size,
+        forward_mode=forward_mode,
+    )
+
+
+def finish_kt_staging_probe(probe: Optional[dict]) -> None:
+    if probe is None:
+        return
+    wait_t = time.perf_counter()
+    probe["done_event"].synchronize()
+    wait_ms = (time.perf_counter() - wait_t) * 1000.0
+    try:
+        copy_ms = probe["start_event"].elapsed_time(probe["end_event"])
+    except Exception:
+        copy_ms = None
+    total_ms = (time.perf_counter() - probe["start_t"]) * 1000.0
+    hidden_ms = max(0.0, total_ms - wait_ms)
+    _kt_staging_probe_log(
+        "h2d_finish",
+        layer=probe["layer"],
+        expert=probe["expert"],
+        slot=probe["slot"],
+        mb=f"{probe['bytes'] / 1024**2:.3f}",
+        wait_ms=f"{wait_ms:.3f}",
+        hidden_ms=f"{hidden_ms:.3f}",
+        total_ms=f"{total_ms:.3f}",
+        copy_ms=f"{copy_ms:.3f}" if copy_ms is not None else None,
+    )
 
 
 class SharedStagingBuffer:
@@ -2687,6 +2800,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Shared staging buffer reference (initialized in create_weights, shared across all layers)
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
+        self._kt_staging_probe_layer: Optional[torch.nn.Module] = None
+        self._kt_staging_probe_device: Optional[torch.device] = None
+        self._kt_staging_probe_state: Optional[dict] = None
+        self._kt_staging_probe_pending: Optional[dict] = None
+        self._kt_staging_probe_cursor: int = 0
+        self._kt_staging_probe_warned: bool = False
 
     def create_weights(
         self,
@@ -2757,6 +2876,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Move mask and mapping tables to GPU for inference
         target_device = next(layer.parameters()).device
+        self._kt_staging_probe_layer = layer
+        self._kt_staging_probe_device = target_device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
 
@@ -2791,6 +2912,272 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
             )
+            _register_kt_staging_probe_method(self)
+
+    def _kt_staging_probe_weight_names(self) -> Optional[List[str]]:
+        layer = self._kt_staging_probe_layer
+        if layer is None:
+            return None
+        if hasattr(layer, "w13_qweight") and hasattr(layer, "w2_qweight"):
+            for optional_name in ("w13_qzeros", "w2_qzeros"):
+                optional = getattr(layer, optional_name, None)
+                if optional is not None and optional.numel() != 0:
+                    if not self._kt_staging_probe_warned:
+                        _kt_staging_probe_log(
+                            "unsupported_wna16_qzeros",
+                            layer=self.kt_config.layer_idx,
+                            optional=optional_name,
+                        )
+                        self._kt_staging_probe_warned = True
+                    return None
+            return _KT_STAGING_PROBE_WEIGHT_NAMES_WNA16
+        if not self._kt_staging_probe_warned:
+            _kt_staging_probe_log(
+                "unsupported_layout",
+                layer=self.kt_config.layer_idx,
+                has_w13_qweight=hasattr(layer, "w13_qweight"),
+                has_w13_weight_packed=hasattr(layer, "w13_weight_packed"),
+            )
+            self._kt_staging_probe_warned = True
+        return None
+
+    def _kt_staging_probe_is_eligible(
+        self, device: Optional[torch.device] = None
+    ) -> bool:
+        if (
+            not self._is_kt_active_rank
+            or self.wrapper is None
+            or self._kt_staging_probe_layer is None
+            or self._kt_staging_probe_device is None
+        ):
+            return False
+        if device is not None and torch.device(device) != self._kt_staging_probe_device:
+            return False
+        if get_tensor_model_parallel_world_size() != 1:
+            if not self._kt_staging_probe_warned:
+                _kt_staging_probe_log(
+                    "unsupported_tp_world_size",
+                    layer=self.kt_config.layer_idx,
+                    tp_world_size=get_tensor_model_parallel_world_size(),
+                )
+                self._kt_staging_probe_warned = True
+            return False
+        return self._kt_staging_probe_weight_names() is not None
+
+    def _kt_staging_probe_configured_experts(self) -> Optional[List[int]]:
+        raw = os.getenv("SGLANG_KT_STAGING_PROBE_EXPERTS")
+        if not raw:
+            return None
+        layer_prefix = f"{self.kt_config.layer_idx}:"
+        for spec in raw.split(";"):
+            spec = spec.strip()
+            if not spec or not spec.startswith(layer_prefix):
+                continue
+            ids = spec[len(layer_prefix) :]
+            out = []
+            for item in ids.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                out.append(int(item))
+            return out or None
+        return None
+
+    def _kt_staging_probe_next_expert(self) -> Optional[int]:
+        configured = self._kt_staging_probe_configured_experts()
+        if configured is not None:
+            candidates = [
+                expert
+                for expert in configured
+                if 0 <= expert < int(getattr(self, "global_num_experts", 0))
+            ]
+        else:
+            with torch.no_grad():
+                cold = torch.where(~self.gpu_experts_mask.cpu())[0]
+                candidates = [int(x) for x in cold.tolist()]
+        if not candidates:
+            return None
+        expert = candidates[self._kt_staging_probe_cursor % len(candidates)]
+        self._kt_staging_probe_cursor += 1
+        return int(expert)
+
+    def _kt_staging_probe_ensure_state(self) -> Optional[dict]:
+        if self._kt_staging_probe_state is not None:
+            return self._kt_staging_probe_state
+
+        layer = self._kt_staging_probe_layer
+        names = self._kt_staging_probe_weight_names()
+        if layer is None or names is None:
+            return None
+
+        cpu_buffers = {}
+        gpu_scratch = {}
+        per_expert_nbytes = {}
+        total_bytes = 0
+        pinned = True
+        alloc_t = time.perf_counter()
+        for name in names:
+            gpu_tensor = getattr(layer, name)
+            shape = (2,) + tuple(gpu_tensor.shape[1:])
+            try:
+                cpu_buf = torch.empty(shape, dtype=gpu_tensor.dtype, pin_memory=True)
+            except Exception:
+                cpu_buf = torch.empty(shape, dtype=gpu_tensor.dtype)
+                pinned = False
+            gpu_buf = torch.empty(shape, dtype=gpu_tensor.dtype, device=gpu_tensor.device)
+            cpu_buffers[name] = cpu_buf
+            gpu_scratch[name] = gpu_buf
+            nbytes = int(cpu_buf[0].numel()) * int(cpu_buf.element_size())
+            per_expert_nbytes[name] = nbytes
+            total_bytes += nbytes
+
+        state = {
+            "cpu_buffers": cpu_buffers,
+            "gpu_scratch": gpu_scratch,
+            "per_expert_nbytes": per_expert_nbytes,
+            "stream": torch.cuda.Stream(device=self._kt_staging_probe_device),
+            "slot_done": [None, None],
+            "pinned": pinned,
+            "total_bytes": total_bytes,
+            "next_slot": 0,
+        }
+        self._kt_staging_probe_state = state
+        _kt_staging_probe_log(
+            "alloc",
+            layer=self.kt_config.layer_idx,
+            names=",".join(names),
+            mb=f"{total_bytes / 1024**2:.3f}",
+            pinned=pinned,
+            alloc_ms=f"{(time.perf_counter() - alloc_t) * 1000.0:.3f}",
+        )
+        return state
+
+    def _kt_staging_probe_submit(self, expert: int, slot: int, state: dict) -> bool:
+        names = self._kt_staging_probe_weight_names()
+        if names != _KT_STAGING_PROBE_WEIGHT_NAMES_WNA16:
+            return False
+
+        prior_event = state["slot_done"][slot]
+        if prior_event is not None:
+            prior_event.synchronize()
+
+        cpu_buffers = state["cpu_buffers"]
+        per_expert_nbytes = state["per_expert_nbytes"]
+        ptrs = {
+            name: int(cpu_buffers[name][slot].data_ptr())
+            for name in _KT_STAGING_PROBE_WEIGHT_NAMES_WNA16
+        }
+        t_submit = time.perf_counter()
+        try:
+            self.wrapper.submit_write_weight_scale_to_buffer(
+                1,
+                int(expert),
+                [ptrs["w13_qweight"]],
+                [ptrs["w13_scales"]],
+                [ptrs["w2_qweight"]],
+                [ptrs["w2_scales"]],
+            )
+        except Exception as err:
+            _kt_staging_probe_log(
+                "submit_error",
+                layer=self.kt_config.layer_idx,
+                expert=expert,
+                slot=slot,
+                error=str(err).splitlines()[0],
+            )
+            return False
+
+        self._kt_staging_probe_pending = {
+            "expert": int(expert),
+            "slot": int(slot),
+            "submit_t": time.perf_counter(),
+            "bytes": sum(per_expert_nbytes.values()),
+        }
+        _kt_staging_probe_log(
+            "cpu_submit",
+            layer=self.kt_config.layer_idx,
+            expert=expert,
+            slot=slot,
+            mb=f"{sum(per_expert_nbytes.values()) / 1024**2:.3f}",
+            elapsed_ms=f"{(time.perf_counter() - t_submit) * 1000.0:.3f}",
+        )
+        return True
+
+    def _kt_staging_probe_step(
+        self, batch_size: int = 0, forward_mode: str = ""
+    ) -> Optional[dict]:
+        state = self._kt_staging_probe_ensure_state()
+        if state is None:
+            return None
+
+        probe = None
+        pending = self._kt_staging_probe_pending
+        if pending is not None:
+            t_sync = time.perf_counter()
+            try:
+                self.wrapper.sync_write_weight_scale_to_buffer()
+            except Exception as err:
+                _kt_staging_probe_log(
+                    "cpu_sync_error",
+                    layer=self.kt_config.layer_idx,
+                    expert=pending["expert"],
+                    slot=pending["slot"],
+                    error=str(err).splitlines()[0],
+                )
+                self._kt_staging_probe_pending = None
+                return None
+            cpu_wait_ms = (time.perf_counter() - t_sync) * 1000.0
+            cpu_total_ms = (time.perf_counter() - pending["submit_t"]) * 1000.0
+            slot = pending["slot"]
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            done_event = torch.cuda.Event()
+            start_t = time.perf_counter()
+            with torch.cuda.stream(state["stream"]):
+                start_event.record(state["stream"])
+                for name, cpu_buf in state["cpu_buffers"].items():
+                    state["gpu_scratch"][name][slot].copy_(
+                        cpu_buf[slot], non_blocking=True
+                    )
+                end_event.record(state["stream"])
+                done_event.record(state["stream"])
+            state["slot_done"][slot] = done_event
+            probe = {
+                "start_t": start_t,
+                "start_event": start_event,
+                "end_event": end_event,
+                "done_event": done_event,
+                "layer": self.kt_config.layer_idx,
+                "expert": pending["expert"],
+                "slot": slot,
+                "bytes": pending["bytes"],
+            }
+            _kt_staging_probe_log(
+                "h2d_start",
+                layer=self.kt_config.layer_idx,
+                expert=pending["expert"],
+                slot=slot,
+                batch_size=batch_size,
+                forward_mode=forward_mode,
+                mb=f"{pending['bytes'] / 1024**2:.3f}",
+                cpu_wait_ms=f"{cpu_wait_ms:.3f}",
+                cpu_total_ms=f"{cpu_total_ms:.3f}",
+                pinned=state["pinned"],
+            )
+            self._kt_staging_probe_pending = None
+
+        next_expert = self._kt_staging_probe_next_expert()
+        if next_expert is not None:
+            slot = state["next_slot"]
+            state["next_slot"] = (slot + 1) % 2
+            self._kt_staging_probe_submit(next_expert, slot, state)
+        else:
+            _kt_staging_probe_log(
+                "no_candidate",
+                layer=self.kt_config.layer_idx,
+            )
+
+        return probe
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
