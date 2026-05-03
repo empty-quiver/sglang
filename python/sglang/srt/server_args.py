@@ -4706,9 +4706,16 @@ class ServerArgs:
             "--kt-expert-placement-strategy",
             type=str,
             default=ServerArgs.kt_expert_placement_strategy,
-            choices=["frequency", "front-loading", "uniform", "random"],
+            choices=[
+                "frequency",
+                "frequency-uniform",
+                "front-loading",
+                "uniform",
+                "random",
+            ],
             help="[ktransformers parameter] GPU expert placement strategy. "
-                 "frequency: Select top-k by activation frequency (default). "
+                 "frequency: Select global top-k by activation frequency. "
+                 "frequency-uniform: Select per-layer top-k by activation frequency while preserving uniform layer counts. "
                  "front-loading: Fill layers from first MoE layer onwards. "
                  "uniform: Equal experts per layer. "
                  "random: Random placement with fixed seed.",

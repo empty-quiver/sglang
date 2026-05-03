@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.managers.io_struct import ExpertDistributionReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -91,6 +92,10 @@ _DFLASH_ROUTE_TIMING_EMPTY_PHASES = {
     "pp.coalesce.skip",
     "pp.coalesce.owner",
 }
+
+
+def _pp_needs_prehandle_forward(req) -> bool:
+    return isinstance(req, ExpertDistributionReq)
 
 
 def _dflash_tensor_shape(tensor: Optional[torch.Tensor]):
@@ -353,6 +358,16 @@ class SchedulerPPMixin:
                 phase_t = time.perf_counter()
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
+                    pp_reqs_pre_sent = False
+                    if not self.pp_group.is_last_rank and recv_reqs:
+                        if any(_pp_needs_prehandle_forward(req) for req in recv_reqs):
+                            self._pp_commit_comm_work(self.send_req_work)
+                            self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                                recv_reqs,
+                                async_send=True,
+                            )
+                            self._pp_commit_comm_work(self.send_req_work)
+                            pp_reqs_pre_sent = True
                     self.process_input_requests(recv_reqs)
                 _dflash_log_timeline(
                     self,
@@ -371,11 +386,12 @@ class SchedulerPPMixin:
                         mb_id=mb_id,
                         start_time=phase_t,
                     )
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
+                    if not pp_reqs_pre_sent:
+                        with torch.profiler.record_function("send_reqs_to_next_stage"):
+                            self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                                recv_reqs,
+                                async_send=True,
+                            )
                     _dflash_log_timeline(
                         self,
                         "pp.req.send",

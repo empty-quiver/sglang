@@ -1575,6 +1575,45 @@ def generate_uniform_masks(
     return masks
 
 
+def generate_frequency_uniform_masks(
+    activation_freq: torch.Tensor,
+    num_gpu_experts: int,
+    first_k_dense_replace: int,
+    moe_layer_freq: int,
+) -> torch.Tensor:
+    """Generate frequency masks while preserving uniform per-layer counts."""
+    num_layers, num_experts = activation_freq.shape
+    masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
+
+    moe_layers = [
+        i
+        for i in range(num_layers)
+        if i >= first_k_dense_replace and i % moe_layer_freq == 0
+    ]
+    num_moe_layers = len(moe_layers)
+    if num_moe_layers == 0:
+        return masks
+
+    experts_per_layer = num_gpu_experts // num_moe_layers
+    remainder = num_gpu_experts % num_moe_layers
+
+    for idx, layer_idx in enumerate(moe_layers):
+        num_for_this_layer = experts_per_layer + (1 if idx < remainder else 0)
+        num_for_this_layer = min(num_for_this_layer, num_experts)
+        if num_for_this_layer <= 0:
+            continue
+        selected = torch.argsort(
+            activation_freq[layer_idx], descending=True, stable=True
+        )[:num_for_this_layer]
+        masks[layer_idx, selected] = True
+
+    for layer_idx in range(num_layers):
+        if layer_idx < first_k_dense_replace or layer_idx % moe_layer_freq != 0:
+            masks[layer_idx, :] = True
+
+    return masks
+
+
 def generate_random_masks(
     num_layers: int,
     num_experts: int,
@@ -1714,7 +1753,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     # Generate masks based on strategy
     tp_rank = get_tensor_model_parallel_rank()
 
-    if strategy == "frequency":
+    if strategy in ("frequency", "frequency-uniform"):
         # Load activation frequency from init_expert_location if it's a .pt file
         init_loc = server_args.init_expert_location
         has_activation_freq = init_loc and init_loc.endswith(".pt")
@@ -1752,12 +1791,13 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                 )
             # Sum across buffer_size (dim0) to get total activation counts per expert
             activation_freq = activation_counts.sum(dim=0).float()  # [num_layers, num_experts]
-            logger.info("Using frequency-based strategy with activation frequency data")
+            logger.info("Using %s strategy with activation frequency data", strategy)
         else:
             # No activation frequency file, use zeros (uniform distribution)
             logger.warning(
-                "Using frequency-based strategy WITHOUT activation frequency data "
+                "Using %s strategy WITHOUT activation frequency data "
                 "(uniform distribution fallback)"
+                % strategy
             )
             activation_freq = torch.zeros(num_layers, num_experts, dtype=torch.float32)
             # For layers that are actually MoE layers, set uniform distribution
@@ -1767,7 +1807,15 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
 
         # Generate masks on rank 0
         if tp_rank == 0:
-            masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts)
+            if strategy == "frequency":
+                masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts)
+            else:
+                masks = generate_frequency_uniform_masks(
+                    activation_freq,
+                    num_gpu_experts,
+                    first_k_dense_replace,
+                    moe_layer_freq,
+                )
             # For non-MoE layers, set all experts to GPU
             for layer_idx in range(num_layers):
                 if layer_idx < first_k_dense_replace or layer_idx % moe_layer_freq != 0:
