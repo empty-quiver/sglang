@@ -193,6 +193,27 @@ def _merge_request_tensor(
     )
 
 
+def _merge_future_recomputed_tensor(
+    name: str,
+    left: Optional[torch.Tensor],
+    right: Optional[torch.Tensor],
+    left_bs: int,
+    right_bs: int,
+) -> Optional[torch.Tensor]:
+    """Merge future-backed CPU metadata that can be recomputed before decode."""
+    merged = _merge_request_tensor(
+        name,
+        left,
+        right,
+        left_bs,
+        right_bs,
+        allow_invalidate=True,
+    )
+    if _request_tensor_rows(merged) == left_bs + right_bs:
+        return merged
+    return None
+
+
 def _get_overlap_plan_stream(
     device: torch.device | str,
 ) -> tuple[Optional[torch.cuda.Stream], contextlib.AbstractContextManager]:
@@ -639,6 +660,13 @@ class DFlashDraftInputV2(SpecInput):
         if right_bs == 0:
             return
 
+        future_backed = self.future_indices is not None
+        other_future_backed = spec_info.future_indices is not None
+        if future_backed != other_future_backed:
+            raise RuntimeError(
+                "DFLASH spec-v2 cannot merge future-backed and concrete batches."
+            )
+
         self.cur_allocated_seq_lens_cpu = _merge_request_tensor(
             "cur_allocated_seq_lens_cpu",
             self.cur_allocated_seq_lens_cpu,
@@ -648,27 +676,48 @@ class DFlashDraftInputV2(SpecInput):
             allow_invalidate=False,
         )
 
-        self.planning_seq_lens_cpu = _merge_request_tensor(
-            "planning_seq_lens_cpu",
-            self.planning_seq_lens_cpu,
-            spec_info.planning_seq_lens_cpu,
-            left_bs,
-            right_bs,
-            allow_invalidate=False,
-        )
+        if future_backed:
+            # `planning_*` and `reserved_*` are host-side planning mirrors. They
+            # may be absent on a newly-prefilled future-backed batch and are
+            # recomputed for the merged request set by `prepare_for_decode`.
+            self.planning_seq_lens_cpu = _merge_future_recomputed_tensor(
+                "planning_seq_lens_cpu",
+                self.planning_seq_lens_cpu,
+                spec_info.planning_seq_lens_cpu,
+                left_bs,
+                right_bs,
+            )
+        else:
+            self.planning_seq_lens_cpu = _merge_request_tensor(
+                "planning_seq_lens_cpu",
+                self.planning_seq_lens_cpu,
+                spec_info.planning_seq_lens_cpu,
+                left_bs,
+                right_bs,
+                allow_invalidate=False,
+            )
         if self.planning_seq_lens_cpu is not None:
             self.planning_seq_lens_sum = int(self.planning_seq_lens_cpu.sum().item())
         else:
             self.planning_seq_lens_sum = None
 
-        self.reserved_seq_lens_cpu = _merge_request_tensor(
-            "reserved_seq_lens_cpu",
-            self.reserved_seq_lens_cpu,
-            spec_info.reserved_seq_lens_cpu,
-            left_bs,
-            right_bs,
-            allow_invalidate=False,
-        )
+        if future_backed:
+            self.reserved_seq_lens_cpu = _merge_future_recomputed_tensor(
+                "reserved_seq_lens_cpu",
+                self.reserved_seq_lens_cpu,
+                spec_info.reserved_seq_lens_cpu,
+                left_bs,
+                right_bs,
+            )
+        else:
+            self.reserved_seq_lens_cpu = _merge_request_tensor(
+                "reserved_seq_lens_cpu",
+                self.reserved_seq_lens_cpu,
+                spec_info.reserved_seq_lens_cpu,
+                left_bs,
+                right_bs,
+                allow_invalidate=False,
+            )
         if self.reserved_seq_lens_cpu is not None:
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
         else:
@@ -732,12 +781,6 @@ class DFlashDraftInputV2(SpecInput):
             self.next_candidates = None
             self.next_positions = None
 
-        future_backed = self.future_indices is not None
-        other_future_backed = spec_info.future_indices is not None
-        if future_backed != other_future_backed:
-            raise RuntimeError(
-                "DFLASH spec-v2 cannot merge future-backed and concrete batches."
-            )
         if future_backed:
             self.topk_p = _merge_request_tensor(
                 "topk_p",

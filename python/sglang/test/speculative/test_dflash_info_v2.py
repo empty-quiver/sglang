@@ -287,6 +287,43 @@ class TestDFlashDraftInputV2(unittest.TestCase):
         self.assertEqual(left.verified_id.shape[0], 0)
         self.assertEqual(left.new_seq_lens.shape[0], 0)
 
+    def test_merge_future_backed_drops_recomputed_length_metadata_if_missing(self):
+        block_size = 3
+        left = _draft_input(
+            rows=1, future_rows=1, block_size=block_size, include_lengths=True
+        )
+        right = _draft_input(
+            rows=3,
+            future_rows=3,
+            block_size=block_size,
+            include_lengths=True,
+            offset=1000,
+        )
+        right.planning_seq_lens_cpu = None
+        right.planning_seq_lens_sum = None
+        right.reserved_seq_lens_cpu = None
+        right.reserved_seq_lens_sum = None
+
+        with self._block_size(block_size):
+            left.merge_batch(right)
+
+        self.assertEqual(left.row_count(), 4)
+        self.assertTrue(
+            torch.equal(left.future_indices.indices, torch.tensor([900, 1900, 1901, 1902]))
+        )
+        self.assertTrue(
+            torch.equal(
+                left.cur_allocated_seq_lens_cpu,
+                torch.tensor([10, 1010, 1011, 1012], dtype=torch.int32),
+            )
+        )
+        self.assertIsNone(left.planning_seq_lens_cpu)
+        self.assertIsNone(left.planning_seq_lens_sum)
+        self.assertIsNone(left.reserved_seq_lens_cpu)
+        self.assertIsNone(left.reserved_seq_lens_sum)
+        self.assertEqual(left.next_candidates.numel(), 4 * block_size)
+        self.assertEqual(left.next_positions.numel(), 4 * block_size)
+
     def test_merge_empty_idle_input_adopts_non_empty_future_backed_state(self):
         block_size = 3
         left = DFlashDraftInputV2.create_idle_input(torch.device("cpu"))
