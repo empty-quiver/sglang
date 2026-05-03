@@ -266,6 +266,44 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     return None
 
 
+def _dflash_run_batch_timing_enabled() -> bool:
+    return os.getenv("SGLANG_DFLASH_RUN_BATCH_TIMING") in ("1", "true", "TRUE")
+
+
+def _log_dflash_run_batch_timing(
+    scheduler,
+    phase: str,
+    batch: Optional[ScheduleBatch],
+    start_time: Optional[float] = None,
+    **fields,
+) -> None:
+    if not _dflash_run_batch_timing_enabled():
+        return
+    if (
+        batch is None
+        or not getattr(scheduler, "enable_overlap", False)
+        or getattr(scheduler, "pp_size", 1) <= 1
+        or getattr(scheduler, "spec_algorithm", None) is None
+        or not scheduler.spec_algorithm.is_dflash()
+    ):
+        return
+    elapsed_ms = None
+    if start_time is not None:
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    parts = [
+        f"phase={phase}",
+        f"pp={getattr(scheduler, 'pp_rank', None)}",
+        f"mode={batch.forward_mode.name if batch is not None else None}",
+        f"bs={batch.batch_size() if batch is not None else 0}",
+        f"rank_is_last={getattr(scheduler.pp_group, 'is_last_rank', None)}",
+    ]
+    if elapsed_ms is not None:
+        parts.append(f"elapsed_ms={elapsed_ms:.3f}")
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    logger.info("DFLASH run_batch timing %s", " ".join(parts))
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -875,7 +913,11 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+        if (
+            self.draft_worker is None
+            or self.spec_algorithm.is_ngram()
+            or getattr(self.draft_worker, "draft_worker", None) is None
+        ):
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
@@ -1949,6 +1991,12 @@ class Scheduler(
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
+                elif self.running_batch is self.last_batch:
+                    logger.warning(
+                        "Skip merging running_batch with itself. "
+                        "This indicates a PP microbatch alias and would duplicate "
+                        "batch tensors."
+                    )
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
@@ -1988,6 +2036,13 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
+        if (
+            self.pp_size > 1
+            and os.getenv("SGLANG_DFLASH_PP_PIPELINE_SLOTS") in ("1", "true", "TRUE")
+            and getattr(self, "spec_algorithm", None) is not None
+            and self.spec_algorithm.is_dflash()
+        ):
+            res = min(res, max(1 - running_bs, 0))
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
@@ -2331,42 +2386,135 @@ class Scheduler(
                 worker_batch_or_batch = batch
 
             if self.enable_overlap:
+                phase_t = time.perf_counter()
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
+                _log_dflash_run_batch_timing(
+                    self,
+                    "scheduler.overlap.record_batch",
+                    batch,
+                    phase_t,
+                )
 
                 # Sampling info will be modified during forward, so we store a copy.
+                phase_t = time.perf_counter()
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
+                _log_dflash_run_batch_timing(
+                    self,
+                    "scheduler.overlap.copy_sampling_info",
+                    batch,
+                    phase_t,
+                )
 
                 bs = len(model_worker_batch.seq_lens)
+                phase_t = time.perf_counter()
                 future_indices = self.future_map.alloc_future_indices(bs)
+                _log_dflash_run_batch_timing(
+                    self,
+                    "scheduler.overlap.alloc_future_indices",
+                    batch,
+                    phase_t,
+                    future_bs=bs,
+                )
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
+                    phase_t = time.perf_counter()
                     self.future_map.resolve_future(model_worker_batch)
+                    _log_dflash_run_batch_timing(
+                        self,
+                        "scheduler.overlap.resolve_future",
+                        batch,
+                        phase_t,
+                    )
                     with self.record_forward_metrics(batch):
+                        kwargs = {}
+                        if self.spec_algorithm.is_dflash() and self.pp_size > 1:
+                            kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+                        phase_t = time.perf_counter()
                         batch_result = self.model_worker.forward_batch_generation(
-                            model_worker_batch
-                            # here pp is not compatible with overlap
+                            model_worker_batch,
+                            **kwargs,
                         )
+                        _log_dflash_run_batch_timing(
+                            self,
+                            "scheduler.overlap.worker_forward",
+                            batch,
+                            phase_t,
+                            can_run_cuda_graph=getattr(
+                                batch_result, "can_run_cuda_graph", None
+                            ),
+                        )
+                    if (
+                        batch.is_spec_v2
+                        and self.spec_algorithm.is_dflash()
+                        and self.pp_size > 1
+                        and model_worker_batch.out_cache_loc is not None
+                    ):
+                        batch.out_cache_loc = model_worker_batch.out_cache_loc
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
-                    if batch_result.delay_sample_func is None:
+                    skip_future_store = (
+                        batch.is_spec_v2
+                        and self.spec_algorithm.is_dflash()
+                        and self.pp_size > 1
+                        and not self.pp_group.is_last_rank
+                        and batch_result.next_draft_input is None
+                    )
+                    if skip_future_store:
+                        phase_t = time.perf_counter()
+                        batch_result.copy_done.record()
+                        _log_dflash_run_batch_timing(
+                            self,
+                            "scheduler.overlap.copy_done_record",
+                            batch,
+                            phase_t,
+                            skip_future_store=True,
+                        )
+                    elif batch_result.delay_sample_func is None:
+                        phase_t = time.perf_counter()
                         self.future_map.store_to_map(future_indices, batch_result)
+                        _log_dflash_run_batch_timing(
+                            self,
+                            "scheduler.overlap.store_to_future",
+                            batch,
+                            phase_t,
+                        )
+                        phase_t = time.perf_counter()
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        _log_dflash_run_batch_timing(
+                            self,
+                            "scheduler.overlap.copy_to_cpu",
+                            batch,
+                            phase_t,
+                            return_logprob=batch.return_logprob,
+                        )
                     else:
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_spec_v2:
+                if batch.is_spec_v2 and not (
+                    self.spec_algorithm.is_dflash()
+                    and self.pp_size > 1
+                    and not self.pp_group.is_last_rank
+                    and batch_result.next_draft_input is None
+                ):
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
 
+                    phase_t = time.perf_counter()
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
+                    _log_dflash_run_batch_timing(
+                        self,
+                        "scheduler.overlap.assign_spec_info",
+                        batch,
+                        phase_t,
+                    )
 
                     # batch.spec_info = EagleDraftInput(
                     #     future_indices=future_indices,

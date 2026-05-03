@@ -1139,46 +1139,47 @@ class FlashInferIndicesUpdaterDecode:
             and wrapper.begin_forward.func == fast_decode_plan
         )
 
-        if wrapper_uses_fast_decode_plan:
-            # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
-            wrapper.begin_forward(
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                data_type=self.data_type,
-                q_data_type=self.q_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
-            )
-        else:
-            # When using original begin_forward, don't pass global_override_indptr_cpu
-            wrapper.begin_forward(
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                data_type=self.data_type,
-                q_data_type=self.q_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-            )
-
-        if locally_override:
-            global_override_indptr_cpu = None
+        try:
+            if wrapper_uses_fast_decode_plan:
+                # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
+                wrapper.begin_forward(
+                    kv_indptr,
+                    kv_indices,
+                    self.kv_last_page_len[:bs],
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    1,
+                    data_type=self.data_type,
+                    q_data_type=self.q_data_type,
+                    non_blocking=True,
+                    fixed_split_size=fixed_split_size,
+                    disable_split_kv=(
+                        disable_split_kv if disable_split_kv is not None else False
+                    ),
+                    global_override_indptr_cpu=global_override_indptr_cpu,
+                )
+            else:
+                # When using original begin_forward, don't pass global_override_indptr_cpu
+                wrapper.begin_forward(
+                    kv_indptr,
+                    kv_indices,
+                    self.kv_last_page_len[:bs],
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    1,
+                    data_type=self.data_type,
+                    q_data_type=self.q_data_type,
+                    non_blocking=True,
+                    fixed_split_size=fixed_split_size,
+                    disable_split_kv=(
+                        disable_split_kv if disable_split_kv is not None else False
+                    ),
+                )
+        finally:
+            if locally_override:
+                global_override_indptr_cpu = None
 
 
 class FlashInferIndicesUpdaterPrefill:
@@ -1576,15 +1577,16 @@ class FlashInferMultiStepDraftBackend:
         indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
         global global_override_indptr_cpu
 
-        for i in range(self.speculative_num_steps - 1):
-            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
-            ]
-            global_override_indptr_cpu = indptr_cpu_whole[i]
-            call_fn(i, forward_batch)
-
-        global_override_indptr_cpu = None
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+                forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                    : seq_lens_sum * self.topk + bs * (i + 1)
+                ]
+                global_override_indptr_cpu = indptr_cpu_whole[i]
+                call_fn(i, forward_batch)
+        finally:
+            global_override_indptr_cpu = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices = torch.empty(

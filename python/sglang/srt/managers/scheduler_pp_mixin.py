@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -42,9 +43,277 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+def _dflash_stable_rid_hash(rid: str) -> int:
+    digest = hashlib.blake2b(str(rid).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _dflash_env_enabled(name: str) -> bool:
+    return os.getenv(name) in ("1", "true", "TRUE")
+
+
+def _dflash_timeline_enabled() -> bool:
+    return _dflash_env_enabled("SGLANG_DFLASH_PP_TIMELINE")
+
+
+def _dflash_route_timing_enabled() -> bool:
+    return _dflash_env_enabled("SGLANG_DFLASH_PP_ROUTE_TIMING")
+
+
+_DFLASH_ROUTE_TIMING_PHASES = {
+    "pp.select_batch",
+    "pp.proxy.recv",
+    "pp.proxy.send",
+    "pp.d2h.sync",
+    "pp.process_result",
+    "pp.output_ring.wait_ready",
+    "pp.output_ring.send",
+    "pp.output_ring.recv",
+    "pp.output_ring.prep_result",
+    "pp.run_batch",
+    "pp.output_ring.result_pending",
+    "pp.output_ring.needs_forward",
+    "pp.output_ring.forwarded",
+    "pp.output_ring.result_drain",
+    "pp.output_ring.forward_drain",
+    "pp.output_intent.arbitrate",
+    "pp.coalesce.skip",
+    "pp.coalesce.owner",
+}
+
+_DFLASH_ROUTE_TIMING_EMPTY_PHASES = {
+    "pp.output_ring.result_pending",
+    "pp.output_ring.needs_forward",
+    "pp.output_ring.forwarded",
+    "pp.output_ring.result_drain",
+    "pp.output_ring.forward_drain",
+    "pp.output_intent.arbitrate",
+    "pp.coalesce.skip",
+    "pp.coalesce.owner",
+}
+
+
+def _dflash_tensor_shape(tensor: Optional[torch.Tensor]):
+    return None if tensor is None else tuple(tensor.shape)
+
+
+def _dflash_tensor_scalar_int(
+    name: str, tensor: Optional[torch.Tensor]
+) -> Optional[int]:
+    if tensor is None:
+        return None
+    if tensor.ndim != 0:
+        raise RuntimeError(
+            f"DFLASH PP {name} metadata must be scalar, "
+            f"got shape={_dflash_tensor_shape(tensor)}."
+        )
+    return int(tensor.detach().to("cpu").item())
+
+
+def _dflash_forward_mode_name(mode: int) -> str:
+    try:
+        return ForwardMode(mode).name
+    except ValueError:
+        return str(mode)
+
+
+def _dflash_batch_rids(batch: Optional[ScheduleBatch]) -> List[str]:
+    if batch is None or batch.is_empty():
+        return []
+    return [str(req.rid) for req in batch.reqs]
+
+
+def _dflash_batch_rid_hashes(batch: Optional[ScheduleBatch]) -> List[int]:
+    if batch is None or batch.is_empty():
+        return []
+    return [_dflash_stable_rid_hash(req.rid) for req in batch.reqs]
+
+
+def _dflash_batch_token_count(batch: Optional[ScheduleBatch]) -> Optional[int]:
+    if batch is None or batch.is_empty():
+        return 0
+    forward_mode = getattr(batch, "forward_mode", None)
+    if forward_mode is not None and forward_mode.is_decode_or_idle():
+        return batch.batch_size()
+    input_ids = getattr(batch, "input_ids", None)
+    if input_ids is not None:
+        return int(input_ids.numel())
+    extend_num_tokens = getattr(batch, "extend_num_tokens", None)
+    if extend_num_tokens is not None:
+        return int(extend_num_tokens)
+    return None
+
+
+def _dflash_log_timeline(
+    scheduler,
+    phase: str,
+    *,
+    mb_id: Optional[int] = None,
+    batch: Optional[ScheduleBatch] = None,
+    metadata: Optional["PPBatchMetadata"] = None,
+    start_time: Optional[float] = None,
+    **fields,
+) -> None:
+    timeline_enabled = _dflash_timeline_enabled()
+    route_timing_only = _dflash_route_timing_enabled() and not timeline_enabled
+    if not timeline_enabled and not route_timing_only:
+        return
+    if route_timing_only and phase not in _DFLASH_ROUTE_TIMING_PHASES:
+        return
+    if (
+        route_timing_only
+        and (batch is None or batch.is_empty())
+        and metadata is None
+        and phase not in _DFLASH_ROUTE_TIMING_EMPTY_PHASES
+    ):
+        return
+    if (
+        timeline_enabled
+        and not _dflash_env_enabled("SGLANG_DFLASH_PP_TIMELINE_IDLE")
+        and (batch is None or batch.is_empty())
+        and int(fields.get("recv", 0) or 0) == 0
+        and int(fields.get("waiting", 0) or 0) == 0
+        and phase not in ("pp.coalesce.skip",)
+    ):
+        return
+
+    elapsed_ms = None
+    if start_time is not None:
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+
+    dispatch_seq = None
+    token_count = _dflash_batch_token_count(batch)
+    if metadata is not None:
+        dispatch_seq = metadata.dispatch_seq
+        if metadata.token_count >= 0:
+            token_count = metadata.token_count
+
+    parts = [
+        f"phase={phase}",
+        f"pp={getattr(scheduler, 'pp_rank', None)}",
+        f"mb={mb_id}",
+        f"dispatch={dispatch_seq}",
+        f"mode={batch.forward_mode.name if batch is not None else None}",
+        f"bs={batch.batch_size() if batch is not None else 0}",
+        f"tokens={token_count}",
+        f"rid_hashes={_dflash_batch_rid_hashes(batch)}",
+    ]
+    if elapsed_ms is not None:
+        parts.append(f"elapsed_ms={elapsed_ms:.3f}")
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    log_kind = "route_timing" if route_timing_only else "timeline"
+    logger.info("DFLASH PP %s %s", log_kind, " ".join(parts))
+
+
+def _dflash_running_mbs_summary(running_mbs: List[ScheduleBatch]):
+    return [
+        {
+            "mb": i,
+            "bs": batch.batch_size(),
+            "rids": _dflash_batch_rids(batch),
+        }
+        for i, batch in enumerate(running_mbs)
+        if batch is not None and not batch.is_empty()
+    ]
+
+
+def _dflash_validate_pp_payload(
+    *,
+    bs: int,
+    block_size: int,
+    dflash_next_candidates: Optional[torch.Tensor],
+    dflash_next_positions: Optional[torch.Tensor],
+    dflash_commit_lens: Optional[torch.Tensor],
+    dflash_committed_tokens: Optional[torch.Tensor],
+    dflash_rid_hashes: Optional[torch.Tensor],
+) -> None:
+    expected_tokens = bs * block_size
+    if dflash_rid_hashes is not None and int(dflash_rid_hashes.numel()) != bs:
+        raise RuntimeError(
+            "DFLASH PP payload request-id hash count mismatch: "
+            f"expected={bs}, got={int(dflash_rid_hashes.numel())}."
+        )
+    if dflash_next_candidates is not None:
+        got = int(dflash_next_candidates.numel())
+        if got != expected_tokens:
+            raise RuntimeError(
+                "DFLASH PP next-candidates shape mismatch: "
+                f"bs={bs}, block_size={block_size}, expected={expected_tokens}, got={got}."
+            )
+    if dflash_next_positions is not None:
+        if dflash_next_candidates is None:
+            raise RuntimeError(
+                "DFLASH PP received next_positions without next_candidates."
+            )
+        got = int(dflash_next_positions.numel())
+        if got != expected_tokens:
+            raise RuntimeError(
+                "DFLASH PP next-positions shape mismatch: "
+                f"bs={bs}, block_size={block_size}, expected={expected_tokens}, got={got}."
+            )
+    if (dflash_commit_lens is None) != (dflash_committed_tokens is None):
+        raise RuntimeError(
+            "DFLASH PP commit_lens and committed_tokens must be present together."
+        )
+    if dflash_commit_lens is not None:
+        got = int(dflash_commit_lens.numel())
+        if got != bs:
+            raise RuntimeError(
+                "DFLASH PP commit_lens shape mismatch: "
+                f"expected={bs}, got={got}."
+            )
+        got = int(dflash_committed_tokens.numel())
+        if got != expected_tokens:
+            raise RuntimeError(
+                "DFLASH PP committed_tokens shape mismatch: "
+                f"bs={bs}, block_size={block_size}, expected={expected_tokens}, got={got}."
+            )
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    dispatch_seq: int = -1
+    mb_id: int = -1
+    batch_size: int = 0
+    forward_mode: int = -1
+    rid_hashes: Tuple[int, ...] = ()
+    token_count: int = -1
+
+
+def _dflash_validate_local_pp_metadata(
+    batch: ScheduleBatch, metadata: PPBatchMetadata
+) -> None:
+    route_mismatch = []
+    local_bs = batch.batch_size()
+    local_rid_hashes = tuple(_dflash_batch_rid_hashes(batch))
+    local_token_count = _dflash_batch_token_count(batch)
+
+    if metadata.batch_size != local_bs:
+        route_mismatch.append(
+            f"bs local={local_bs} metadata={metadata.batch_size}"
+        )
+    if metadata.rid_hashes != local_rid_hashes:
+        route_mismatch.append(
+            f"rid_hashes local={list(local_rid_hashes)} "
+            f"metadata={list(metadata.rid_hashes)}"
+        )
+    if local_token_count is not None:
+        if metadata.token_count < 0:
+            route_mismatch.append(
+                f"tokens local={local_token_count} metadata=missing"
+            )
+        elif metadata.token_count != local_token_count:
+            route_mismatch.append(
+                f"tokens local={local_token_count} metadata={metadata.token_count}"
+            )
+
+    if route_mismatch:
+        raise RuntimeError(
+            "DFLASH PP local route metadata is stale before follower commit: "
+            + ", ".join(route_mismatch)
+        )
 
 
 class SchedulerPPMixin:
@@ -81,20 +350,88 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                phase_t = time.perf_counter()
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
                     self.process_input_requests(recv_reqs)
+                _dflash_log_timeline(
+                    self,
+                    "pp.recv_requests",
+                    mb_id=mb_id,
+                    start_time=phase_t,
+                    recv=len(recv_reqs),
+                    waiting=len(self.waiting_queue),
+                )
                 if not self.pp_group.is_last_rank:
+                    phase_t = time.perf_counter()
                     self._pp_commit_comm_work(self.send_req_work)
+                    _dflash_log_timeline(
+                        self,
+                        "pp.req.prev_send_wait",
+                        mb_id=mb_id,
+                        start_time=phase_t,
+                    )
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
                             async_send=True,
                         )
+                    _dflash_log_timeline(
+                        self,
+                        "pp.req.send",
+                        mb_id=mb_id,
+                        recv=len(recv_reqs),
+                    )
+                phase_t = time.perf_counter()
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    self.mbs[mb_id] = self.get_next_batch_to_run()
+                    dflash_run_control = None
+                    selected_batch = None
+                    if self._pp_dflash_run_control_enabled():
+                        if self.pp_group.is_first_rank:
+                            selected_batch = (
+                                self._pp_dflash_select_authoritative_batch(mb_id)
+                            )
+                            dflash_run_control = self._pp_dflash_make_run_control(
+                                mb_id, selected_batch
+                            )
+                        else:
+                            dflash_run_control = self._pp_dflash_recv_run_control(
+                                mb_id
+                            )
+                            selected_batch = self._pp_dflash_select_follower_batch(
+                                mb_id, dflash_run_control
+                            )
+                        self._pp_dflash_validate_run_control(
+                            mb_id, selected_batch, dflash_run_control
+                        )
+                        self._pp_dflash_forward_run_control(dflash_run_control)
+                        if bool(dflash_run_control["run"]):
+                            self.mbs[mb_id] = selected_batch
+                    else:
+                        selected_batch = self._pp_dflash_select_authoritative_batch(mb_id)
+                        self.mbs[mb_id] = selected_batch
                 self.running_mbs[mb_id] = self.running_batch
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch: Optional[ScheduleBatch] = selected_batch
+                _dflash_log_timeline(
+                    self,
+                    "pp.select_batch",
+                    mb_id=mb_id,
+                    batch=self.cur_batch,
+                    start_time=phase_t,
+                    waiting=len(self.waiting_queue),
+                )
+                if _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE"):
+                    logger.info(
+                        "DFLASH BS trace PP%d mb=%d selected mode=%s bs=%d "
+                        "rids=%s running_mbs=%s waiting=%d",
+                        self.pp_rank,
+                        mb_id,
+                        self.cur_batch.forward_mode.name if self.cur_batch else None,
+                        self.cur_batch.batch_size() if self.cur_batch else 0,
+                        _dflash_batch_rids(self.cur_batch),
+                        _dflash_running_mbs_summary(self.running_mbs),
+                        len(self.waiting_queue),
+                    )
                 if self.cur_batch:
                     dflash_debug = os.getenv("SGLANG_DFLASH_DEBUG") in (
                         "1",
@@ -115,7 +452,20 @@ class SchedulerPPMixin:
                             f"mb_id={mb_id} about to _pp_recv_proxy_tensors()",
                             flush=True,
                         )
+                    phase_t = time.perf_counter()
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    _dflash_log_timeline(
+                        self,
+                        "pp.proxy.recv",
+                        mb_id=mb_id,
+                        batch=self.cur_batch,
+                        start_time=phase_t,
+                        proxy_keys=(
+                            list(pp_proxy_tensors.tensors.keys())
+                            if pp_proxy_tensors is not None
+                            else None
+                        ),
+                    )
                     if dflash_debug:
                         print(
                             f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
@@ -123,6 +473,22 @@ class SchedulerPPMixin:
                             f"{list(pp_proxy_tensors.tensors.keys()) if pp_proxy_tensors else None}",
                             flush=True,
                         )
+                    if (
+                        os.getenv("SGLANG_DFLASH_PP_PROXY_PROBE") in ("1", "true", "TRUE")
+                        and pp_proxy_tensors is not None
+                        and self.cur_batch.spec_algorithm.is_dflash()
+                        and self.cur_batch.forward_mode.is_decode()
+                    ):
+                        hidden = pp_proxy_tensors.tensors.get("hidden_states", None)
+                        if hidden is not None and hidden.numel() > 0:
+                            rows = hidden[: min(int(hidden.shape[0]), 4)].float()
+                            logger.info(
+                                "DFLASH PP%d recv proxy hidden shape=%s row_sums=%s row_norms=%s",
+                                self.pp_rank,
+                                tuple(hidden.shape),
+                                rows.sum(dim=1).detach().cpu().tolist(),
+                                rows.norm(dim=1).detach().cpu().tolist(),
+                            )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -133,7 +499,14 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                phase_t = time.perf_counter()
                 self._pp_commit_comm_work(self.send_proxy_work)
+                _dflash_log_timeline(
+                    self,
+                    "pp.proxy.prev_send_wait",
+                    mb_id=mb_id,
+                    start_time=phase_t,
+                )
                 if self.cur_batch:
                     if dflash_debug:
                         print(
@@ -153,21 +526,24 @@ class SchedulerPPMixin:
                             f"mb_id={mb_id} _pp_launch_batch DONE",
                             flush=True,
                         )
-                if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
+                    if (
+                        os.getenv("SGLANG_DFLASH_PP_PROXY_PROBE") in ("1", "true", "TRUE")
+                        and self.cur_batch.spec_algorithm.is_dflash()
+                        and self.cur_batch.forward_mode.is_decode()
+                        and result.pp_hidden_states_proxy_tensors is not None
+                    ):
+                        hidden = result.pp_hidden_states_proxy_tensors.tensors.get(
+                            "hidden_states", None
                         )
-                    )
-                if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    with torch.profiler.record_function("process_batch_result"):
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                        if hidden is not None and hidden.numel() > 0:
+                            rows = hidden[: min(int(hidden.shape[0]), 4)].float()
+                            logger.info(
+                                "DFLASH PP%d send proxy hidden shape=%s row_sums=%s row_norms=%s",
+                                self.pp_rank,
+                                tuple(hidden.shape),
+                                rows.sum(dim=1).detach().cpu().tolist(),
+                                rows.norm(dim=1).detach().cpu().tolist(),
+                            )
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(self.launch_event)
@@ -178,6 +554,13 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                             )
+                        _dflash_log_timeline(
+                            self,
+                            "pp.proxy.send",
+                            mb_id=mb_id,
+                            batch=self.cur_batch,
+                            metadata=self.mb_metadata[mb_id],
+                        )
                         if dflash_debug:
                             print(
                                 f"[DFLASH-DEBUG PP{self.pp_rank}] sched_loop "
@@ -185,9 +568,67 @@ class SchedulerPPMixin:
                                 flush=True,
                             )
 
+                if self.server_args.pp_async_batch_depth == 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                result_mb_id = getattr(self, "pp_output_result_mb_id", next_mb_id)
+                if self.mbs[result_mb_id] is not None and d2h_event is not None:
+                    server_is_idle = False
+                    phase_t = time.perf_counter()
+                    d2h_event.synchronize()
+                    _dflash_log_timeline(
+                        self,
+                        "pp.d2h.sync",
+                        mb_id=result_mb_id,
+                        batch=self.mbs[result_mb_id],
+                        metadata=self.mb_metadata[result_mb_id],
+                        start_time=phase_t,
+                    )
+                    phase_t = time.perf_counter()
+                    with torch.profiler.record_function("process_batch_result"):
+                        self._pp_process_batch_result(
+                            self.mbs[result_mb_id],
+                            next_batch_result,
+                        )
+                    _dflash_log_timeline(
+                        self,
+                        "pp.process_result",
+                        mb_id=result_mb_id,
+                        batch=self.mbs[result_mb_id],
+                        metadata=self.mb_metadata[result_mb_id],
+                        start_time=phase_t,
+                    )
+                    self.last_mbs[result_mb_id] = self.mbs[result_mb_id]
+
                 self.pp_outputs = next_pp_outputs
 
-            # When the server is idle, self-check and re-init some states
+            # When the server is idle, self-check and re-init some states.
+            # DFlash PP can have drain-only iterations where no new batch is
+            # selected, but output-ring tensors are still queued or a prior
+            # microbatch result has not made it back to rank 0 yet. Those
+            # allocations are live, not leaks, so defer the idle checker until
+            # the ring is empty.
+            if server_is_idle and self._pp_dflash_has_pending_ring_work():
+                _dflash_log_timeline(
+                    self,
+                    "pp.idle.defer",
+                    pending_results=sorted(
+                        getattr(self, "dflash_pp_pending_result_mb_ids", set())
+                    ),
+                    pending_forward=sorted(
+                        getattr(self, "dflash_pp_pending_forward_mb_ids", set())
+                    ),
+                    last_rank_queue=len(getattr(self, "last_rank_comm_queue", [])),
+                    has_pp_outputs=getattr(self, "pp_outputs", None) is not None,
+                    send_output_work=len(getattr(self, "send_output_work", [])),
+                    send_proxy_work=len(getattr(self, "send_proxy_work", [])),
+                )
+                server_is_idle = False
+
             if server_is_idle:
                 self.self_check_during_idle()
 
@@ -576,7 +1017,482 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
+        self.send_dflash_run_control_work = []
+        self.send_dflash_output_intent_work = []
         self.launch_event = None
+        self.dflash_pp_prefill_hold_until = 0.0
+        self.dflash_pp_dispatch_seq = 0
+        self.dflash_pp_unsafe_coalesce_warned = False
+        self.dflash_pp_pending_result_mb_ids = set()
+        self.dflash_pp_pending_forward_mb_ids = set()
+        self.dflash_pp_sticky_chunked_req_mb_id = None
+        self.dflash_pp_sticky_chunked_req_hash = None
+
+    def _pp_dflash_has_pending_ring_work(self: Scheduler) -> bool:
+        if not self._pp_dflash_run_control_enabled():
+            return False
+        if getattr(self, "dflash_pp_pending_result_mb_ids", None):
+            return True
+        if getattr(self, "dflash_pp_pending_forward_mb_ids", None):
+            return True
+        if getattr(self, "pp_outputs", None) is not None:
+            return True
+        if len(getattr(self, "last_rank_comm_queue", [])) > 0:
+            return True
+        if len(getattr(self, "send_output_work", [])) > 0:
+            return True
+        if len(getattr(self, "send_proxy_work", [])) > 0:
+            return True
+        return False
+
+    def _pp_dflash_pipeline_slots_enabled(self: Scheduler) -> bool:
+        return self._pp_dflash_run_control_enabled() and _dflash_env_enabled(
+            "SGLANG_DFLASH_PP_PIPELINE_SLOTS"
+        )
+
+    def _pp_dflash_sticky_chunked_prefill_enabled(self: Scheduler) -> bool:
+        return (
+            self._pp_dflash_run_control_enabled()
+            and _dflash_env_enabled("SGLANG_DFLASH_PP_STICKY_CHUNKED_PREFILL")
+            and _dflash_env_enabled("SGLANG_DFLASH_PP_COALESCE")
+            and not self._pp_dflash_pipeline_slots_enabled()
+        )
+
+    def _pp_dflash_note_selected_batch(
+        self: Scheduler, mb_id: int, batch: Optional[ScheduleBatch]
+    ) -> None:
+        if not self._pp_dflash_sticky_chunked_prefill_enabled():
+            return
+
+        chunked_req = getattr(self, "chunked_req", None)
+        if chunked_req is None:
+            self.dflash_pp_sticky_chunked_req_mb_id = None
+            self.dflash_pp_sticky_chunked_req_hash = None
+            return
+
+        batch_chunked_req = getattr(batch, "chunked_req", None)
+        forward_mode = getattr(batch, "forward_mode", None)
+        if (
+            batch is None
+            or forward_mode is None
+            or not forward_mode.is_extend()
+            or batch_chunked_req is None
+        ):
+            return
+
+        chunked_req_hash = _dflash_stable_rid_hash(batch_chunked_req.rid)
+        self.dflash_pp_sticky_chunked_req_mb_id = mb_id
+        self.dflash_pp_sticky_chunked_req_hash = chunked_req_hash
+        _dflash_log_timeline(
+            self,
+            "pp.coalesce.owner",
+            mb_id=mb_id,
+            batch=batch,
+            reason="sticky_chunked_prefill_owner",
+            owner_mb=mb_id,
+            chunked_rid_hash=chunked_req_hash,
+        )
+
+    def _pp_should_skip_slot_for_dflash_sticky_chunked_prefill(
+        self: Scheduler, mb_id: int
+    ) -> bool:
+        if not self._pp_dflash_sticky_chunked_prefill_enabled():
+            return False
+        if not self.pp_group.is_first_rank:
+            return False
+
+        chunked_req = getattr(self, "chunked_req", None)
+        if chunked_req is None:
+            self.dflash_pp_sticky_chunked_req_mb_id = None
+            self.dflash_pp_sticky_chunked_req_hash = None
+            return False
+
+        owner_mb = getattr(self, "dflash_pp_sticky_chunked_req_mb_id", None)
+        if owner_mb is None:
+            return False
+        if owner_mb < 0 or owner_mb >= getattr(self, "pp_loop_size", 0):
+            self.dflash_pp_sticky_chunked_req_mb_id = None
+            self.dflash_pp_sticky_chunked_req_hash = None
+            return False
+
+        chunked_req_hash = _dflash_stable_rid_hash(chunked_req.rid)
+        owner_hash = getattr(self, "dflash_pp_sticky_chunked_req_hash", None)
+        if owner_hash is not None and owner_hash != chunked_req_hash:
+            # A stale owner from an earlier request should never hold the loop.
+            self.dflash_pp_sticky_chunked_req_mb_id = None
+            self.dflash_pp_sticky_chunked_req_hash = None
+            return False
+
+        if owner_mb == mb_id:
+            return False
+
+        if _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE"):
+            logger.info(
+                "DFLASH PP sticky chunked prefill skip PP%d empty_mb=%d "
+                "owner_mb=%d chunked_rid=%s",
+                self.pp_rank,
+                mb_id,
+                owner_mb,
+                chunked_req.rid,
+            )
+        _dflash_log_timeline(
+            self,
+            "pp.coalesce.skip",
+            mb_id=mb_id,
+            waiting=len(self.waiting_queue),
+            reason="sticky_chunked_prefill",
+            owner_mb=owner_mb,
+            chunked_rid_hash=chunked_req_hash,
+        )
+        return True
+
+    def _pp_should_skip_slot_for_dflash_coalesce(self: Scheduler, mb_id: int) -> bool:
+        """Leave an empty PP slot idle so DFlash can form larger PP batches.
+
+        This is safe only when one rank owns the RUN/IDLE cadence. For DFlash
+        PP the first rank sends authoritative run-control metadata before the
+        follower selects a batch, so PP0 may intentionally leave an empty slot
+        idle while followers simply obey the RUN=false control. Without that
+        controller, local coalescing remains behind an explicit unsafe opt-in.
+        """
+        if not _dflash_env_enabled("SGLANG_DFLASH_PP_COALESCE"):
+            return False
+        authoritative_pp_control = self._pp_dflash_run_control_enabled()
+        if authoritative_pp_control and not self.pp_group.is_first_rank:
+            return False
+        if not authoritative_pp_control:
+            if not _dflash_env_enabled("SGLANG_DFLASH_PP_ALLOW_UNSAFE_LOCAL_COALESCE"):
+                if not getattr(self, "dflash_pp_unsafe_coalesce_warned", False):
+                    logger.warning(
+                        "Ignoring SGLANG_DFLASH_PP_COALESCE because local DFlash PP "
+                        "RUN/IDLE coalescing can desynchronize PP route cadence. "
+                        "Set SGLANG_DFLASH_PP_ALLOW_UNSAFE_LOCAL_COALESCE=1 to "
+                        "run this experimental path."
+                    )
+                    self.dflash_pp_unsafe_coalesce_warned = True
+                return False
+        if self.pp_size <= 1 or not self.spec_algorithm.is_dflash():
+            return False
+        if self._pp_dflash_pipeline_slots_enabled():
+            return False
+        if len(self.waiting_queue) == 0:
+            return False
+
+        current = self.running_mbs[mb_id]
+        if current is not None and not current.is_empty():
+            return False
+
+        max_bs = self.server_args.pp_max_micro_batch_size
+        if max_bs is None or max_bs <= 1:
+            return False
+
+        if any(str(req.rid).startswith("HEALTH_CHECK_") for req in self.waiting_queue):
+            self.dflash_pp_prefill_hold_until = 0.0
+            return False
+
+        active_batches = [
+            batch
+            for batches in (self.running_mbs, self.mbs, self.last_mbs)
+            for batch in batches
+            if batch is not None and not batch.is_empty()
+        ]
+        waiting_bs = len(self.waiting_queue)
+        if not active_batches and waiting_bs < max_bs:
+            now = time.monotonic()
+            hold_ms = float(os.getenv("SGLANG_DFLASH_PP_PREFILL_HOLD_MS", "50"))
+            if self.dflash_pp_prefill_hold_until <= 0.0:
+                self.dflash_pp_prefill_hold_until = now + max(hold_ms, 0.0) / 1000.0
+            if now < self.dflash_pp_prefill_hold_until:
+                if _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE"):
+                    logger.info(
+                        "DFLASH PP coalesce hold PP%d empty_mb=%d waiting=%d "
+                        "target_bs=%d hold_ms=%.1f",
+                        self.pp_rank,
+                        mb_id,
+                        waiting_bs,
+                        max_bs,
+                        hold_ms,
+                    )
+                _dflash_log_timeline(
+                    self,
+                    "pp.coalesce.skip",
+                    mb_id=mb_id,
+                    waiting=waiting_bs,
+                    reason="prefill_hold",
+                    target_bs=max_bs,
+                )
+                return True
+            self.dflash_pp_prefill_hold_until = 0.0
+        else:
+            self.dflash_pp_prefill_hold_until = 0.0
+
+        if not _dflash_env_enabled("SGLANG_DFLASH_PP_COALESCE_ACTIVE"):
+            return False
+
+        # Skipping an empty slot while another PP slot is active can break the
+        # output-ring send/recv cadence. Keep that experiment behind a separate
+        # gate until the ring carries explicit per-slot phase markers.
+        for other_id, other in enumerate(self.running_mbs):
+            if other_id == mb_id or other is None or other.is_empty():
+                continue
+            if other.batch_size() >= max_bs or other.batch_is_full:
+                continue
+            if (
+                other.spec_algorithm is not None
+                and other.spec_algorithm.is_dflash()
+            ):
+                if _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE"):
+                    logger.info(
+                        "DFLASH PP coalesce skip PP%d empty_mb=%d target_mb=%d "
+                        "target_bs=%d target_rids=%s waiting=%d",
+                        self.pp_rank,
+                        mb_id,
+                        other_id,
+                        other.batch_size(),
+                        _dflash_batch_rids(other),
+                        len(self.waiting_queue),
+                    )
+                _dflash_log_timeline(
+                    self,
+                    "pp.coalesce.skip",
+                    mb_id=mb_id,
+                    batch=other,
+                    waiting=len(self.waiting_queue),
+                    reason="active_batch_has_capacity",
+                    active_mb=other_id,
+                    target_bs=max_bs,
+                )
+                return True
+        return False
+
+    def _pp_dflash_run_control_enabled(self: Scheduler) -> bool:
+        return (
+            self.pp_size > 1
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_dflash()
+        )
+
+    def _pp_dflash_select_authoritative_batch(
+        self: Scheduler, mb_id: int
+    ) -> Optional[ScheduleBatch]:
+        if mb_id in getattr(self, "dflash_pp_pending_result_mb_ids", set()):
+            _dflash_log_timeline(
+                self,
+                "pp.output_ring.result_drain",
+                mb_id=mb_id,
+                pending=sorted(self.dflash_pp_pending_result_mb_ids),
+            )
+            return None
+        if mb_id in getattr(self, "dflash_pp_pending_forward_mb_ids", set()):
+            _dflash_log_timeline(
+                self,
+                "pp.output_ring.forward_drain",
+                mb_id=mb_id,
+                pending=sorted(self.dflash_pp_pending_forward_mb_ids),
+            )
+            return None
+        if self._pp_should_skip_slot_for_dflash_sticky_chunked_prefill(mb_id):
+            return None
+        if self._pp_should_skip_slot_for_dflash_coalesce(mb_id):
+            return None
+        selected_batch = self.get_next_batch_to_run()
+        self._pp_dflash_note_selected_batch(mb_id, selected_batch)
+        return selected_batch
+
+    def _pp_dflash_select_follower_batch(
+        self: Scheduler, mb_id: int, control: Dict[str, object]
+    ) -> Optional[ScheduleBatch]:
+        if not bool(control["run"]):
+            self._pp_dflash_cleanup_follower_idle_slot(mb_id)
+            return None
+        if self._pp_should_skip_slot_for_dflash_coalesce(mb_id):
+            raise RuntimeError(
+                "DFLASH PP follower attempted a local coalesce skip for an "
+                f"authoritative RUN slot: mb={mb_id}, control={control}."
+            )
+        return self.get_next_batch_to_run()
+
+    def _pp_dflash_cleanup_follower_idle_slot(self: Scheduler, mb_id: int) -> None:
+        current = self.running_batch
+        if current is None or current.is_empty():
+            return
+        before_bs = current.batch_size()
+        current.filter_batch(v1_spec_info_filtered=True)
+        after_bs = current.batch_size()
+        if current.is_empty():
+            current.batch_is_full = False
+        if after_bs < before_bs:
+            _dflash_log_timeline(
+                self,
+                "pp.follower_idle.cleanup",
+                mb_id=mb_id,
+                before_bs=before_bs,
+                after_bs=after_bs,
+                remaining_rids=_dflash_batch_rids(current),
+            )
+
+    def _pp_dflash_make_run_control(
+        self: Scheduler, mb_id: int, batch: Optional[ScheduleBatch]
+    ) -> Dict[str, object]:
+        run = batch is not None and not batch.is_empty()
+        token_count = _dflash_batch_token_count(batch)
+        control: Dict[str, object] = {
+            "kind": "dflash_pp_run_control",
+            "mb_id": int(mb_id),
+            "run": bool(run),
+            "batch_size": int(batch.batch_size()) if run else 0,
+            "forward_mode": int(batch.forward_mode) if run else -1,
+            "rid_hashes": tuple(_dflash_batch_rid_hashes(batch)) if run else (),
+            "token_count": int(token_count) if token_count is not None else -1,
+        }
+        _dflash_log_timeline(
+            self,
+            "pp.run_control.make",
+            mb_id=mb_id,
+            batch=batch,
+            control=control,
+        )
+        return control
+
+    def _pp_dflash_recv_run_control(
+        self: Scheduler, mb_id: int
+    ) -> Dict[str, object]:
+        data = self._pp_recv_pyobj_from_prev_stage()
+        if not isinstance(data, list) or len(data) != 1:
+            raise RuntimeError(
+                "DFLASH PP expected exactly one run-control object from the "
+                f"previous stage for mb={mb_id}, got {data!r}."
+            )
+        control = data[0]
+        if not isinstance(control, dict) or control.get("kind") != "dflash_pp_run_control":
+            raise RuntimeError(
+                "DFLASH PP received invalid run-control object from the "
+                f"previous stage for mb={mb_id}: {control!r}."
+            )
+        if int(control.get("mb_id", -1)) != int(mb_id):
+            raise RuntimeError(
+                "DFLASH PP run-control mb mismatch: "
+                f"local={mb_id}, control={control}."
+            )
+        _dflash_log_timeline(
+            self,
+            "pp.run_control.recv",
+            mb_id=mb_id,
+            control=control,
+        )
+        return control
+
+    def _pp_dflash_forward_run_control(
+        self: Scheduler, control: Dict[str, object]
+    ) -> None:
+        if self.pp_group.is_last_rank:
+            return
+        self._pp_commit_comm_work(self.send_dflash_run_control_work)
+        self.send_dflash_run_control_work = self._pp_send_pyobj_to_next_stage(
+            [control], async_send=True
+        )
+        _dflash_log_timeline(
+            self,
+            "pp.run_control.send",
+            mb_id=int(control["mb_id"]),
+            control=control,
+        )
+
+    def _pp_dflash_validate_run_control(
+        self: Scheduler,
+        mb_id: int,
+        batch: Optional[ScheduleBatch],
+        control: Dict[str, object],
+    ) -> None:
+        local_run = batch is not None and not batch.is_empty()
+        control_run = bool(control["run"])
+        mismatches = []
+        if local_run != control_run:
+            mismatches.append(f"run local={local_run} control={control_run}")
+        if local_run:
+            local_token_count = _dflash_batch_token_count(batch)
+            local = {
+                "batch_size": int(batch.batch_size()),
+                "forward_mode": int(batch.forward_mode),
+                "rid_hashes": tuple(_dflash_batch_rid_hashes(batch)),
+                "token_count": int(local_token_count)
+                if local_token_count is not None
+                else -1,
+            }
+            for key, value in local.items():
+                if control.get(key) != value:
+                    mismatches.append(
+                        f"{key} local={value!r} control={control.get(key)!r}"
+                    )
+        if mismatches:
+            raise RuntimeError(
+                "DFLASH PP authoritative RUN/IDLE control mismatch: "
+                f"pp={self.pp_rank}, mb={mb_id}, "
+                + ", ".join(mismatches)
+            )
+
+    def _pp_dflash_make_output_intent(
+        self: Scheduler, mb_id: int, will_send: bool
+    ) -> Dict[str, object]:
+        return {
+            "kind": "dflash_pp_output_intent",
+            "mb_id": int(mb_id),
+            "send": bool(will_send),
+        }
+
+    def _pp_dflash_will_send_output(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        mbs: List[ScheduleBatch],
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
+        pp_outputs: PPProxyTensors | None,
+    ) -> bool:
+        if self.pp_group.is_last_rank:
+            batch = mbs[next_first_rank_mb_id]
+            return (
+                batch is not None
+                and not batch.forward_mode.is_prebuilt()
+                and len(last_rank_comm_queue) > 0
+            )
+        return bool(pp_outputs)
+
+    def _pp_dflash_forward_output_intent(
+        self: Scheduler, intent: Dict[str, object]
+    ) -> None:
+        self._pp_commit_comm_work(self.send_dflash_output_intent_work)
+        self.send_dflash_output_intent_work = self._pp_send_pyobj_to_next_stage(
+            [intent], async_send=True
+        )
+        _dflash_log_timeline(
+            self,
+            "pp.output_intent.send",
+            mb_id=int(intent["mb_id"]),
+            send=bool(intent["send"]),
+        )
+
+    def _pp_dflash_recv_output_intent(
+        self: Scheduler, mb_id: int
+    ) -> Dict[str, object]:
+        data = self._pp_recv_pyobj_from_prev_stage()
+        if not isinstance(data, list) or len(data) != 1:
+            raise RuntimeError(
+                "DFLASH PP expected exactly one output-intent object from the "
+                f"previous stage for mb={mb_id}, got {data!r}."
+            )
+        intent = data[0]
+        if not isinstance(intent, dict) or intent.get("kind") != "dflash_pp_output_intent":
+            raise RuntimeError(
+                "DFLASH PP received invalid output-intent object from the "
+                f"previous stage for mb={mb_id}: {intent!r}."
+            )
+        _dflash_log_timeline(
+            self,
+            "pp.output_intent.recv",
+            mb_id=mb_id,
+            send=bool(intent["send"]),
+            source_mb=int(intent.get("mb_id", -1)),
+        )
+        return intent
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -900,7 +1816,17 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         next_mb_id: int,
     ) -> Tuple[PPProxyTensors, GenerationBatchResult, torch.cuda.Event]:
+        phase_t = time.perf_counter()
         self._pp_commit_comm_work(work=self.send_output_work)
+        _dflash_log_timeline(
+            self,
+            "pp.output_ring.prev_send_wait",
+            mb_id=next_mb_id,
+            batch=self.mbs[next_mb_id] if self.mbs[next_mb_id] is not None else None,
+            metadata=self.mb_metadata[next_mb_id],
+            start_time=phase_t,
+        )
+        self.pp_output_result_mb_id = next_mb_id
         (
             next_pp_outputs,
             next_batch_result,
@@ -954,7 +1880,10 @@ class SchedulerPPMixin:
         return data
 
     def _pp_prepare_tensor_dict(
-        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+        self: Scheduler,
+        result: GenerationBatchResult,
+        batch: ScheduleBatch,
+        metadata: Optional[PPBatchMetadata] = None,
     ) -> Dict[str, torch.Tensor]:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
@@ -984,11 +1913,57 @@ class SchedulerPPMixin:
         if result.dflash_committed_tokens is not None:
             tensor_dict["dflash_committed_tokens"] = result.dflash_committed_tokens
             # Pack accepted-length scalar so PP0's spec metrics stay accurate.
-            tensor_dict["dflash_num_accepted_tokens"] = torch.tensor(
-                int(result.num_accepted_tokens),
-                dtype=torch.int32,
-                device=result.dflash_committed_tokens.device,
+            if result.dflash_commit_lens is not None:
+                tensor_dict["dflash_num_accepted_tokens"] = torch.clamp(
+                    result.dflash_commit_lens.to(torch.int32) - 1, min=0
+                ).sum()
+            else:
+                tensor_dict["dflash_num_accepted_tokens"] = torch.tensor(
+                    int(result.num_accepted_tokens),
+                    dtype=torch.int32,
+                    device=result.dflash_committed_tokens.device,
+                )
+        dflash_payload_tensor = result.dflash_next_candidates
+        if dflash_payload_tensor is None:
+            dflash_payload_tensor = result.dflash_commit_lens
+        if dflash_payload_tensor is None:
+            dflash_payload_tensor = result.dflash_committed_tokens
+        if dflash_payload_tensor is not None:
+            tensor_dict["dflash_rid_hashes"] = torch.tensor(
+                [_dflash_stable_rid_hash(req.rid) for req in batch.reqs],
+                dtype=torch.int64,
+                device=dflash_payload_tensor.device,
             )
+        if batch.spec_algorithm.is_dflash():
+            meta_tensor = dflash_payload_tensor
+            if meta_tensor is None:
+                meta_tensor = result.next_token_ids
+            if meta_tensor is not None and "dflash_rid_hashes" not in tensor_dict:
+                tensor_dict["dflash_rid_hashes"] = torch.tensor(
+                    [_dflash_stable_rid_hash(req.rid) for req in batch.reqs],
+                    dtype=torch.int64,
+                    device=meta_tensor.device,
+                )
+            if meta_tensor is not None and metadata is not None:
+                tensor_dict["dflash_pp_mb_id"] = torch.tensor(
+                    int(metadata.mb_id), dtype=torch.int32, device=meta_tensor.device
+                )
+                tensor_dict["dflash_pp_dispatch_seq"] = torch.tensor(
+                    int(metadata.dispatch_seq),
+                    dtype=torch.int64,
+                    device=meta_tensor.device,
+                )
+                tensor_dict["dflash_pp_batch_size"] = torch.tensor(
+                    int(metadata.batch_size), dtype=torch.int32, device=meta_tensor.device
+                )
+                tensor_dict["dflash_pp_token_count"] = torch.tensor(
+                    int(metadata.token_count), dtype=torch.int32, device=meta_tensor.device
+                )
+                tensor_dict["dflash_pp_forward_mode"] = torch.tensor(
+                    int(metadata.forward_mode),
+                    dtype=torch.int32,
+                    device=meta_tensor.device,
+                )
 
         return tensor_dict
 
@@ -1049,7 +2024,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.output_ids = pp_outputs["next_token_ids"]
+        next_token_ids = pp_outputs["next_token_ids"]
 
         # DFLASH spec-v1 PP=2: pluck the next iter's drafter candidates and this
         # iter's verify commit info off the output ring. PPProxyTensors's
@@ -1067,16 +2042,177 @@ class SchedulerPPMixin:
         dflash_commit_lens = proxy_dict.get("dflash_commit_lens", None)
         dflash_committed_tokens = proxy_dict.get("dflash_committed_tokens", None)
         dflash_num_accepted = proxy_dict.get("dflash_num_accepted_tokens", None)
-        dflash_accept_length_per_req_cpu = (
-            [max(0, int(x) - 1) for x in dflash_commit_lens.to("cpu").tolist()]
-            if dflash_commit_lens is not None
-            else None
-        )
-        if (
+        dflash_rid_hashes = proxy_dict.get("dflash_rid_hashes", None)
+        dflash_pp_mb_id = proxy_dict.get("dflash_pp_mb_id", None)
+        dflash_pp_dispatch_seq = proxy_dict.get("dflash_pp_dispatch_seq", None)
+        dflash_pp_batch_size = proxy_dict.get("dflash_pp_batch_size", None)
+        dflash_pp_token_count = proxy_dict.get("dflash_pp_token_count", None)
+        dflash_pp_forward_mode = proxy_dict.get("dflash_pp_forward_mode", None)
+        dflash_accept_length_per_req_cpu = None
+        is_dflash_pp_follower = (
             not batch.spec_algorithm.is_none()
             and batch.spec_algorithm.is_dflash()
             and not self.pp_group.is_last_rank
-        ):
+        )
+        if is_dflash_pp_follower:
+            payload_mb_id = _dflash_tensor_scalar_int(
+                "dflash_pp_mb_id", dflash_pp_mb_id
+            )
+            payload_dispatch_seq = _dflash_tensor_scalar_int(
+                "dflash_pp_dispatch_seq", dflash_pp_dispatch_seq
+            )
+            payload_bs = _dflash_tensor_scalar_int(
+                "dflash_pp_batch_size", dflash_pp_batch_size
+            )
+            payload_token_count = _dflash_tensor_scalar_int(
+                "dflash_pp_token_count", dflash_pp_token_count
+            )
+            payload_mode = _dflash_tensor_scalar_int(
+                "dflash_pp_forward_mode", dflash_pp_forward_mode
+            )
+            _dflash_log_timeline(
+                self,
+                "pp.output_ring.payload",
+                mb_id=mb_metadata.mb_id if mb_metadata is not None else None,
+                batch=batch,
+                metadata=mb_metadata,
+                payload_mb=payload_mb_id,
+                payload_dispatch=payload_dispatch_seq,
+                payload_bs=payload_bs,
+                payload_tokens=payload_token_count,
+                payload_mode=payload_mode,
+            )
+            if mb_metadata is None:
+                raise RuntimeError(
+                    "DFLASH PP missing local route metadata before follower commit."
+                )
+            _dflash_validate_local_pp_metadata(batch, mb_metadata)
+
+            required_route_metadata = {
+                "dflash_pp_mb_id": payload_mb_id,
+                "dflash_pp_dispatch_seq": payload_dispatch_seq,
+                "dflash_pp_batch_size": payload_bs,
+                "dflash_pp_token_count": payload_token_count,
+                "dflash_pp_forward_mode": payload_mode,
+                "dflash_rid_hashes": dflash_rid_hashes,
+            }
+            missing_route_metadata = [
+                name
+                for name, value in required_route_metadata.items()
+                if value is None
+            ]
+            if missing_route_metadata:
+                raise RuntimeError(
+                    "DFLASH PP payload missing route metadata before follower "
+                    f"commit: {missing_route_metadata}."
+                )
+
+            route_mismatch = []
+            local_token_count = _dflash_batch_token_count(batch)
+            if payload_mb_id != mb_metadata.mb_id:
+                route_mismatch.append(
+                    f"mb local={mb_metadata.mb_id} payload={payload_mb_id}"
+                )
+            if payload_dispatch_seq != mb_metadata.dispatch_seq:
+                route_mismatch.append(
+                    "dispatch "
+                    f"local={mb_metadata.dispatch_seq} "
+                    f"payload={payload_dispatch_seq}"
+                )
+            if payload_bs != batch.batch_size() or payload_bs != mb_metadata.batch_size:
+                route_mismatch.append(
+                    f"bs local={batch.batch_size()} metadata={mb_metadata.batch_size} "
+                    f"payload={payload_bs}"
+                )
+            if payload_mode != mb_metadata.forward_mode:
+                route_mismatch.append(
+                    "mode "
+                    f"local={_dflash_forward_mode_name(mb_metadata.forward_mode)}"
+                    f"({mb_metadata.forward_mode}) "
+                    f"payload={_dflash_forward_mode_name(payload_mode)}"
+                    f"({payload_mode})"
+                )
+            if local_token_count is not None:
+                if payload_token_count != local_token_count:
+                    route_mismatch.append(
+                        f"tokens local={local_token_count} "
+                        f"payload={payload_token_count}"
+                    )
+            if (
+                mb_metadata.token_count >= 0
+                and payload_token_count != mb_metadata.token_count
+            ):
+                route_mismatch.append(
+                    f"tokens metadata={mb_metadata.token_count} "
+                    f"payload={payload_token_count}"
+                )
+            if route_mismatch:
+                raise RuntimeError(
+                    "DFLASH PP route metadata mismatch before follower commit: "
+                    + ", ".join(route_mismatch)
+                )
+            if _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE"):
+                logger.info(
+                    "DFLASH BS trace PP%d payload local_bs=%d local_rids=%s "
+                    "candidate_shape=%s position_shape=%s commit_shape=%s "
+                    "committed_shape=%s rid_hash_shape=%s payload_hashes=%s",
+                    self.pp_rank,
+                    batch.batch_size(),
+                    _dflash_batch_rids(batch),
+                    _dflash_tensor_shape(dflash_next_candidates),
+                    _dflash_tensor_shape(dflash_next_positions),
+                    _dflash_tensor_shape(dflash_commit_lens),
+                    _dflash_tensor_shape(dflash_committed_tokens),
+                    _dflash_tensor_shape(dflash_rid_hashes),
+                    dflash_rid_hashes.detach().cpu().tolist()
+                    if dflash_rid_hashes is not None
+                    else None,
+                )
+            _dflash_validate_pp_payload(
+                bs=batch.batch_size(),
+                block_size=int(self.server_args.speculative_num_draft_tokens),
+                dflash_next_candidates=dflash_next_candidates,
+                dflash_next_positions=dflash_next_positions,
+                dflash_commit_lens=dflash_commit_lens,
+                dflash_committed_tokens=dflash_committed_tokens,
+                dflash_rid_hashes=dflash_rid_hashes,
+            )
+            dflash_accept_length_per_req_cpu = (
+                [max(0, int(x) - 1) for x in dflash_commit_lens.to("cpu").tolist()]
+                if dflash_commit_lens is not None
+                else None
+            )
+            if dflash_rid_hashes is not None:
+                local_rid_hashes = torch.tensor(
+                    [_dflash_stable_rid_hash(req.rid) for req in batch.reqs],
+                    dtype=torch.int64,
+                    device=dflash_rid_hashes.device,
+                )
+                payload_hashes = dflash_rid_hashes.to(
+                    device=local_rid_hashes.device, dtype=torch.int64
+                )
+                if local_rid_hashes.shape != payload_hashes.shape or not torch.equal(
+                    local_rid_hashes, payload_hashes
+                ):
+                    logger.error(
+                        "DFLASH PP rid mismatch: local_rids=%s local_hashes=%s payload_hashes=%s",
+                        [req.rid for req in batch.reqs],
+                        local_rid_hashes.detach().cpu().tolist(),
+                        payload_hashes.detach().cpu().tolist(),
+                    )
+                    raise RuntimeError(
+                        "DFLASH PP payload request ids do not match local batch "
+                        f"order (dispatch={mb_metadata.dispatch_seq}, "
+                        f"mb={mb_metadata.mb_id})"
+                    )
+                if _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE"):
+                    logger.info(
+                        "DFLASH PP rid match: rids=%s hashes=%s",
+                        [req.rid for req in batch.reqs],
+                        local_rid_hashes.detach().cpu().tolist(),
+                    )
+            if not batch.is_spec_v2:
+                batch.output_ids = next_token_ids
             self._pp_dflash_apply_follower_commit(
                 batch=batch,
                 commit_lens=dflash_commit_lens,
@@ -1085,10 +2221,18 @@ class SchedulerPPMixin:
                 next_positions=dflash_next_positions,
             )
 
+        if not is_dflash_pp_follower and not batch.is_spec_v2:
+            batch.output_ids = next_token_ids
+        accept_lens = None
+        if batch.is_spec_v2 and dflash_commit_lens is not None:
+            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            accept_lens = dflash_commit_lens.to("cpu", non_blocking=True)
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
-            next_token_ids=pp_outputs["next_token_ids"],
+            next_token_ids=next_token_ids,
+            accept_lens=accept_lens,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
@@ -1131,9 +2275,103 @@ class SchedulerPPMixin:
             DFlashDraftInput,
             DFlashVerifyInput,
         )
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
-        if next_candidates is None:
-            # Nothing to do; PP1 didn't ship candidates this iter (idle batch?).
+        if next_candidates is None and commit_lens is None and committed_tokens is None:
+            # Nothing to do; PP1 didn't ship DFlash state this iter (idle batch?).
+            return
+        if (commit_lens is None) != (committed_tokens is None):
+            raise RuntimeError(
+                "DFLASH PP follower received an incomplete commit payload: "
+                f"commit_lens={commit_lens is not None}, "
+                f"committed_tokens={committed_tokens is not None}."
+            )
+        trace_bs = _dflash_env_enabled("SGLANG_DFLASH_BS_TRACE")
+        mode_before = batch.forward_mode.name
+        if trace_bs:
+            logger.info(
+                "DFLASH BS trace PP%d follower input bs=%d rids=%s mode=%s "
+                "commit_lens=%s committed_shape=%s next_candidates_shape=%s "
+                "next_positions_shape=%s spec_v2=%s",
+                self.pp_rank,
+                batch.batch_size(),
+                _dflash_batch_rids(batch),
+                mode_before,
+                commit_lens.detach().cpu().tolist() if commit_lens is not None else None,
+                _dflash_tensor_shape(committed_tokens),
+                _dflash_tensor_shape(next_candidates),
+                _dflash_tensor_shape(next_positions),
+                batch.is_spec_v2,
+            )
+
+        if batch.is_spec_v2:
+            old_draft_input = (
+                batch.spec_info
+                if isinstance(batch.spec_info, DFlashDraftInputV2)
+                else None
+            )
+            if commit_lens is not None and committed_tokens is not None:
+                worker = getattr(self, "draft_worker", None) or getattr(
+                    self, "model_worker", None
+                ) or self.tp_worker
+                if not hasattr(worker, "pp_apply_follower_commit_v2"):
+                    raise RuntimeError(
+                        "DFLASH PP spec-v2 follower could not locate "
+                        "pp_apply_follower_commit_v2 on the spec worker "
+                        f"(got {type(worker).__name__})."
+                    )
+                attn_backend = getattr(
+                    worker.target_worker.model_runner, "attn_backend", None
+                )
+                need_mamba_verify_commit = hasattr(
+                    attn_backend, "update_mamba_state_after_mtp_verify"
+                )
+                seq_lens_pre_verify = (
+                    batch.seq_lens.clone() if need_mamba_verify_commit else None
+                )
+                worker.pp_apply_follower_commit_v2(
+                    batch=batch,
+                    commit_lens=commit_lens,
+                )
+                if need_mamba_verify_commit:
+                    worker._update_target_mamba_state_after_verify(
+                        batch=batch,
+                        seq_lens_pre_verify=seq_lens_pre_verify,
+                        commit_lens=commit_lens,
+                    )
+                batch.forward_mode = ForwardMode.DECODE
+
+            bs = batch.batch_size()
+            zero32 = torch.zeros((bs,), dtype=torch.int32, device=batch.device)
+            new_draft_input = DFlashDraftInputV2(
+                topk_p=torch.empty((bs, 0), device=batch.device, dtype=torch.float32),
+                topk_index=torch.empty((bs, 0), device=batch.device, dtype=torch.int64),
+                verified_id=zero32.clone(),
+                new_seq_lens=batch.seq_lens.to(dtype=torch.int32),
+                hidden_states=torch.empty(
+                    (bs, 0), device=batch.device, dtype=torch.float16
+                ),
+                cur_allocated_seq_lens_cpu=(
+                    old_draft_input.reserved_seq_lens_cpu
+                    if old_draft_input is not None
+                    and old_draft_input.reserved_seq_lens_cpu is not None
+                    else batch.seq_lens_cpu
+                ),
+                next_candidates=next_candidates,
+                next_positions=next_positions,
+            )
+            batch.spec_info = new_draft_input
+            if trace_bs:
+                logger.info(
+                    "DFLASH BS trace PP%d follower output bs=%d rids=%s "
+                    "mode_before=%s mode_after=%s spec_info_candidates=%s",
+                    self.pp_rank,
+                    batch.batch_size(),
+                    _dflash_batch_rids(batch),
+                    mode_before,
+                    batch.forward_mode.name,
+                    _dflash_tensor_shape(next_candidates),
+                )
             return
 
         # Decode iters carry verify-commit; prefill iters (drafter-prime only)
@@ -1204,6 +2442,17 @@ class SchedulerPPMixin:
             next_positions=next_positions,
         )
         batch.spec_info = draft_input
+        if trace_bs:
+            logger.info(
+                "DFLASH BS trace PP%d follower output bs=%d rids=%s "
+                "mode_before=%s mode_after=%s spec_info_candidates=%s",
+                self.pp_rank,
+                batch.batch_size(),
+                _dflash_batch_rids(batch),
+                mode_before,
+                batch.forward_mode.name,
+                _dflash_tensor_shape(next_candidates),
+            )
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
@@ -1223,20 +2472,66 @@ class SchedulerPPMixin:
             if mbs[next_first_rank_mb_id] is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
+                    phase_t = time.perf_counter()
                     torch.cuda.current_stream().wait_event(q_event)
+                    _dflash_log_timeline(
+                        self,
+                        "pp.output_ring.wait_ready",
+                        mb_id=next_first_rank_mb_id,
+                        batch=mbs[next_first_rank_mb_id],
+                        start_time=phase_t,
+                    )
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                        phase_t = time.perf_counter()
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
                             async_send=True,
                         )
+                    _dflash_log_timeline(
+                        self,
+                        "pp.output_ring.send",
+                        mb_id=next_first_rank_mb_id,
+                        batch=mbs[next_first_rank_mb_id],
+                        start_time=phase_t,
+                        keys=list(pp_outputs_to_send.tensors.keys()),
+                    )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
             if pp_outputs:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                    phase_t = time.perf_counter()
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
                         async_send=True,
                     )
+                _dflash_log_timeline(
+                    self,
+                    "pp.output_ring.send",
+                    mb_id=next_first_rank_mb_id,
+                    batch=mbs[next_first_rank_mb_id]
+                    if mbs[next_first_rank_mb_id] is not None
+                    else None,
+                    start_time=phase_t,
+                    keys=list(pp_outputs.tensors.keys()),
+                )
+                if self._pp_dflash_run_control_enabled():
+                    payload_mb_tensor = pp_outputs.tensors.get("dflash_pp_mb_id", None)
+                    if payload_mb_tensor is not None:
+                        forwarded_mb_id = _dflash_tensor_scalar_int(
+                            "dflash_pp_mb_id", payload_mb_tensor
+                        )
+                        if forwarded_mb_id is not None:
+                            self.dflash_pp_pending_forward_mb_ids.discard(
+                                forwarded_mb_id
+                            )
+                            _dflash_log_timeline(
+                                self,
+                                "pp.output_ring.forwarded",
+                                mb_id=forwarded_mb_id,
+                                pending=sorted(
+                                    self.dflash_pp_pending_forward_mb_ids
+                                ),
+                            )
         return send_output_work
 
     def _pp_send_recv_and_preprocess_output_tensors(
@@ -1251,29 +2546,135 @@ class SchedulerPPMixin:
         next_pp_outputs = None
         d2h_event = None
         batch_result = None
-        send_output_work = self._pp_send_output_to_next_stage(
-            next_first_rank_mb_id,
-            mbs,
-            last_rank_comm_queue,
-            pp_outputs,
-        )
+        result_mb_id = next_mb_id
+        if self._pp_dflash_run_control_enabled():
+            will_send_output = self._pp_dflash_will_send_output(
+                next_first_rank_mb_id,
+                mbs,
+                last_rank_comm_queue,
+                pp_outputs,
+            )
+            output_intent = self._pp_dflash_make_output_intent(
+                next_first_rank_mb_id, will_send_output
+            )
+            self._pp_dflash_forward_output_intent(output_intent)
+            prev_output_intent = self._pp_dflash_recv_output_intent(next_mb_id)
+            prev_has_output = bool(prev_output_intent["send"])
+            send_output_now = will_send_output
+            should_recv_output = prev_has_output
+            if self.pp_size == 2 and will_send_output and prev_has_output:
+                # NCCL point-to-point ops are order-sensitive. In PP=2, both
+                # ranks can have output at the same time, and posting both
+                # sends before both receives can deadlock. Drain the pending
+                # ring-forward from the non-last rank first; the last rank's
+                # local output remains queued for the next scheduler tick.
+                send_output_now = not self.pp_group.is_last_rank
+                should_recv_output = self.pp_group.is_last_rank
+                _dflash_log_timeline(
+                    self,
+                    "pp.output_intent.arbitrate",
+                    mb_id=next_first_rank_mb_id,
+                    local_has=will_send_output,
+                    prev_has=prev_has_output,
+                    send_now=send_output_now,
+                    recv_now=should_recv_output,
+                )
+            send_output_work = []
+            if send_output_now:
+                send_output_work = self._pp_send_output_to_next_stage(
+                    next_first_rank_mb_id,
+                    mbs,
+                    last_rank_comm_queue,
+                    pp_outputs,
+                )
+            if send_output_now and not send_output_work:
+                raise RuntimeError(
+                    "DFLASH PP output intent predicted a tensor send, but no "
+                    f"send work was posted on pp={self.pp_rank}, "
+                    f"mb={next_first_rank_mb_id}."
+                )
+        else:
+            send_output_work = self._pp_send_output_to_next_stage(
+                next_first_rank_mb_id,
+                mbs,
+                last_rank_comm_queue,
+                pp_outputs,
+            )
+            should_recv_output = (
+                mbs[next_mb_id] is not None
+                and not mbs[next_mb_id].forward_mode.is_prebuilt()
+            )
 
-        if mbs[next_mb_id] is not None:
+        if should_recv_output:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = None
-                if not mbs[next_mb_id].forward_mode.is_prebuilt():
-                    next_pp_outputs = PPProxyTensors(
-                        self._pp_recv_dict_from_prev_stage()
+                phase_t = time.perf_counter()
+                next_pp_outputs = PPProxyTensors(
+                    self._pp_recv_dict_from_prev_stage()
+                )
+                if self._pp_dflash_run_control_enabled():
+                    payload_mb_tensor = next_pp_outputs.tensors.get(
+                        "dflash_pp_mb_id", None
                     )
-            if not mbs[next_mb_id].forward_mode.is_prebuilt():
-                with self.copy_stream_ctx:
-                    self.copy_stream.wait_stream(self.default_stream)
-                    batch_result = self._pp_prep_batch_result(
-                        mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
+                    if payload_mb_tensor is not None:
+                        payload_mb_id = _dflash_tensor_scalar_int(
+                            "dflash_pp_mb_id", payload_mb_tensor
+                        )
+                        if payload_mb_id is None or not (0 <= payload_mb_id < len(mbs)):
+                            raise RuntimeError(
+                                "DFLASH PP received output payload with invalid "
+                                f"mb id {payload_mb_id!r}; expected range "
+                                f"[0, {len(mbs)})."
+                            )
+                        result_mb_id = payload_mb_id
+                if (
+                    self._pp_dflash_run_control_enabled()
+                    and not self.pp_group.is_last_rank
+                ):
+                    self.dflash_pp_pending_result_mb_ids.discard(result_mb_id)
+                    self.dflash_pp_pending_forward_mb_ids.add(result_mb_id)
+                    _dflash_log_timeline(
+                        self,
+                        "pp.output_ring.needs_forward",
+                        mb_id=result_mb_id,
+                        pending_results=sorted(
+                            self.dflash_pp_pending_result_mb_ids
+                        ),
+                        pending=sorted(self.dflash_pp_pending_forward_mb_ids),
                     )
-                    d2h_event = torch.cuda.Event()
-                    d2h_event.record(torch.cuda.current_stream())
+                _dflash_log_timeline(
+                    self,
+                    "pp.output_ring.recv",
+                    mb_id=result_mb_id,
+                    batch=mbs[result_mb_id],
+                    metadata=mb_metadata[result_mb_id],
+                    start_time=phase_t,
+                    expected_mb=next_mb_id,
+                    keys=list(next_pp_outputs.tensors.keys()),
+                )
 
+        if (
+            mbs[result_mb_id] is not None
+            and next_pp_outputs is not None
+            and not mbs[result_mb_id].forward_mode.is_prebuilt()
+        ):
+            with self.copy_stream_ctx:
+                self.copy_stream.wait_stream(self.default_stream)
+                phase_t = time.perf_counter()
+                batch_result = self._pp_prep_batch_result(
+                    mbs[result_mb_id], mb_metadata[result_mb_id], next_pp_outputs
+                )
+                _dflash_log_timeline(
+                    self,
+                    "pp.output_ring.prep_result",
+                    mb_id=result_mb_id,
+                    batch=mbs[result_mb_id],
+                    metadata=mb_metadata[result_mb_id],
+                    start_time=phase_t,
+                )
+                d2h_event = torch.cuda.Event()
+                d2h_event.record(torch.cuda.current_stream())
+
+        self.pp_output_result_mb_id = result_mb_id
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
     def _pp_launch_batch(
@@ -1286,10 +2687,49 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.default_stream)
-                result = self.run_batch(self.cur_batch, pp_proxy_tensors)
-                mb_metadata[mb_id] = PPBatchMetadata(
+                dispatch_seq = self.dflash_pp_dispatch_seq
+                self.dflash_pp_dispatch_seq += 1
+                phase_t = time.perf_counter()
+                route_batch = self.cur_batch
+                route_token_count = _dflash_batch_token_count(route_batch)
+                route_metadata = {
+                    "batch_size": route_batch.batch_size(),
+                    "forward_mode": int(route_batch.forward_mode),
+                    "rid_hashes": tuple(_dflash_batch_rid_hashes(route_batch)),
+                    "token_count": route_token_count if route_token_count is not None else -1,
+                }
+                result = self.run_batch(route_batch, pp_proxy_tensors)
+                metadata = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
+                    dispatch_seq=dispatch_seq,
+                    mb_id=mb_id,
+                    batch_size=route_metadata["batch_size"],
+                    forward_mode=route_metadata["forward_mode"],
+                    rid_hashes=route_metadata["rid_hashes"],
+                    token_count=route_metadata["token_count"],
                 )
+                mb_metadata[mb_id] = metadata
+                _dflash_log_timeline(
+                    self,
+                    "pp.run_batch",
+                    mb_id=mb_id,
+                    batch=self.cur_batch,
+                    metadata=metadata,
+                    start_time=phase_t,
+                    cuda_graph=result.can_run_cuda_graph,
+                )
+                if (
+                    self._pp_dflash_run_control_enabled()
+                    and self.pp_group.is_first_rank
+                ):
+                    self.dflash_pp_pending_result_mb_ids.add(mb_id)
+                    _dflash_log_timeline(
+                        self,
+                        "pp.output_ring.result_pending",
+                        mb_id=mb_id,
+                        metadata=metadata,
+                        pending=sorted(self.dflash_pp_pending_result_mb_ids),
+                    )
                 event = torch.cuda.Event()
                 event.record(torch.cuda.current_stream())
                 if self.pp_group.is_last_rank:
@@ -1298,7 +2738,9 @@ class SchedulerPPMixin:
                         (
                             event,
                             PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, self.cur_batch)
+                                self._pp_prepare_tensor_dict(
+                                    result, self.cur_batch, metadata
+                                )
                             ),
                         )
                     )

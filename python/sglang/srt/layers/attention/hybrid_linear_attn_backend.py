@@ -180,12 +180,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if forward_batch.spec_info.topk > 1:
+                if getattr(forward_batch.spec_info, "retrive_next_token", None) is not None:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
-                    # retrieve_next_token is None during dummy run so skip tensor creation
-                    if retrieve_next_token is not None:
-                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                    retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -394,13 +392,19 @@ class MambaAttnBackendBase(AttentionBackend):
                 torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
             )
             self.retrieve_next_token_list.append(
-                torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                torch.full(
+                    (i + 1, draft_token_num),
+                    fill_value=-1,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
             )
             self.retrieve_next_sibling_list.append(
-                torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                torch.full(
+                    (i + 1, draft_token_num),
+                    fill_value=-1,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
             )
             self.retrieve_parent_token_list.append(
@@ -439,11 +443,22 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
-        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
-            # They are None during cuda graph capture so skip the copy_...
-            # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
-            # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
+        has_retrieve_chain = (
+            forward_mode.is_target_verify()
+            and spec_info is not None
+            and getattr(spec_info, "retrive_next_token", None) is not None
+        )
+        if has_retrieve_chain:
+            bs_without_pad = spec_info.retrive_next_token.shape[0]
+            self.retrieve_next_token_list[bs - 1].fill_(-1)
+            self.retrieve_next_sibling_list[bs - 1].fill_(-1)
+            self.retrieve_parent_token_list[bs - 1].zero_()
+            self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
+                spec_info.retrive_next_token
+            )
+            self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
+                spec_info.retrive_next_sibling
+            )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -500,9 +515,16 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
-        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
+        has_retrieve_chain = (
+            forward_mode.is_target_verify()
+            and spec_info is not None
+            and getattr(spec_info, "retrive_next_token", None) is not None
+        )
+        if has_retrieve_chain:
             bs_without_pad = spec_info.retrive_next_token.shape[0]
+            self.retrieve_next_token_list[bs - 1].fill_(-1)
+            self.retrieve_next_sibling_list[bs - 1].fill_(-1)
+            self.retrieve_parent_token_list[bs - 1].zero_()
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
                 spec_info.retrive_next_token
             )

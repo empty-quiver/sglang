@@ -54,6 +54,64 @@ logger = logging.getLogger(__name__)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
 
 
+def _kt_timing_enabled() -> bool:
+    return os.getenv("SGLANG_KT_TIMING") in ("1", "true", "TRUE")
+
+
+def _kt_timing_sync_enabled() -> bool:
+    return os.getenv("SGLANG_KT_TIMING_SYNC") in ("1", "true", "TRUE")
+
+
+def _kt_timing_sync_allowed() -> bool:
+    if not _kt_timing_sync_enabled():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return not torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _kt_timing_layer_enabled(layer_idx: int) -> bool:
+    layers = os.getenv("SGLANG_KT_TIMING_LAYERS")
+    if not layers:
+        return True
+    wanted = set()
+    for raw in layers.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if "-" in raw:
+            start, end = raw.split("-", 1)
+            wanted.update(range(int(start), int(end) + 1))
+        else:
+            wanted.add(int(raw))
+    return int(layer_idx) in wanted
+
+
+def _kt_log_timing(method, phase: str, start_time: Optional[float] = None, **fields):
+    if not _kt_timing_enabled() or not _kt_timing_layer_enabled(method.kt_config.layer_idx):
+        return
+    elapsed_ms = None
+    if start_time is not None:
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    parts = [
+        f"phase={phase}",
+        f"layer={method.kt_config.layer_idx}",
+        f"pp={getattr(getattr(method, 'pp_group', None), 'rank', None)}",
+        f"tp={getattr(method, 'tp_rank', None)}",
+        f"active={getattr(method, '_is_kt_active_rank', None)}",
+        f"gpu_experts={getattr(method, 'num_gpu_experts', None)}",
+        f"cpu_experts={getattr(method, 'global_num_experts', 0) - getattr(method, 'num_gpu_experts', 0)}",
+    ]
+    if elapsed_ms is not None:
+        parts.append(f"elapsed_ms={elapsed_ms:.3f}")
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    logger.info("KT timing %s", " ".join(parts))
+
+
 @dataclass
 class KTConfig:
     """Configuration for KTransformers heterogeneous computing CPU part.
@@ -2452,8 +2510,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_weights, topk_ids, _ = topk_output
 
         # Submit forward task to CPU (non-blocking)
+        t_submit = time.perf_counter()
         self.wrapper.submit_forward(
             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+        )
+        _kt_log_timing(
+            self,
+            "kt.cpu_submit_enqueue",
+            t_submit,
+            tokens=int(x.shape[0]) if x.dim() > 0 else 0,
         )
 
     def sync(self, x: torch.Tensor) -> torch.Tensor:
@@ -2471,9 +2536,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             return torch.zeros_like(x)
 
         # Wait for CPU computation and retrieve results
-        return self.wrapper.sync_forward(
+        t_sync = time.perf_counter()
+        result = self.wrapper.sync_forward(
             x, torch.cuda.current_stream(x.device).cuda_stream
         )
+        _kt_log_timing(
+            self,
+            "kt.cpu_sync_enqueue",
+            t_sync,
+            tokens=int(x.shape[0]) if x.dim() > 0 else 0,
+        )
+        return result
 
     def _submit_with_staged_input(
         self,
@@ -2499,11 +2572,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_weights, topk_ids, _ = topk_output
 
         # Submit forward task using staged buffer
+        t_submit = time.perf_counter()
         self.wrapper.submit_forward(
             staged_hidden_states,
             topk_ids,
             topk_weights,
             torch.cuda.current_stream(staged_hidden_states.device).cuda_stream,
+        )
+        _kt_log_timing(
+            self,
+            "kt.cpu_submit_enqueue",
+            t_submit,
+            tokens=int(staged_hidden_states.shape[0])
+            if staged_hidden_states.dim() > 0
+            else 0,
+            staged=True,
         )
 
     def _sync_with_staged_input(
@@ -2520,10 +2603,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if not self._is_kt_active_rank or self.wrapper is None:
             return torch.zeros_like(staged_hidden_states)
 
-        return self.wrapper.sync_forward(
+        t_sync = time.perf_counter()
+        result = self.wrapper.sync_forward(
             staged_hidden_states,
             torch.cuda.current_stream(staged_hidden_states.device).cuda_stream,
         )
+        _kt_log_timing(
+            self,
+            "kt.cpu_sync_enqueue",
+            t_sync,
+            tokens=int(staged_hidden_states.shape[0])
+            if staged_hidden_states.dim() > 0
+            else 0,
+            staged=True,
+        )
+        return result
 
     def apply(
         self,
@@ -2560,6 +2654,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+        _kt_log_timing(
+            self,
+            "kt.apply.begin",
+            tokens=num_tokens,
+            threshold=self.gpu_prefill_token_threshold,
+            full_gpu=(
+                self.gpu_prefill_token_threshold > 0
+                and num_tokens >= self.gpu_prefill_token_threshold
+            ),
+        )
 
         # Check for full GPU fallback
         if (
@@ -2573,6 +2677,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             compute_time = (time.perf_counter() - t_compute) * 1000.0
+            _kt_log_timing(
+                self,
+                "kt.full_gpu.compute",
+                tokens=num_tokens,
+                elapsed_ms=f"{compute_time:.3f}",
+            )
 
             # Dynamic expert update: analyze batch and update GPU experts
             if self.kt_config.kt_enable_dynamic_expert_update:
@@ -2585,6 +2695,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 update_time = (time.perf_counter() - t_update) * 1000.0
+                _kt_log_timing(
+                    self,
+                    "kt.dynamic_update",
+                    tokens=num_tokens,
+                    elapsed_ms=f"{update_time:.3f}",
+                )
 
                 if self._is_kt_active_rank:
                     logger.info(
@@ -2606,17 +2722,39 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
+        cpu_timing_start_event = None
+        cpu_timing_end_event = None
         if self._is_kt_active_rank and self._cpu_stream is not None:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
 
             # Copy to staging buffer on main stream
+            t_stage = time.perf_counter()
             staging_buffer.copy_(x, non_blocking=True)
+            _kt_log_timing(
+                self,
+                "kt.staging_copy_enqueue",
+                t_stage,
+                tokens=num_tokens,
+            )
 
             # Fork to cpu_stream (waits for staging copy to complete)
+            t_wait_stream = time.perf_counter()
             self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
+            _kt_log_timing(
+                self,
+                "kt.cpu_stream_wait_enqueue",
+                t_wait_stream,
+                tokens=num_tokens,
+            )
             with torch.cuda.stream(self._cpu_stream):
+                if _kt_timing_sync_allowed() and _kt_timing_layer_enabled(
+                    self.kt_config.layer_idx
+                ):
+                    cpu_timing_start_event = torch.cuda.Event(enable_timing=True)
+                    cpu_timing_end_event = torch.cuda.Event(enable_timing=True)
+                    cpu_timing_start_event.record(self._cpu_stream)
                 # Submit uses staging_buffer, so GPU can modify original x freely
                 self._submit_with_staged_input(
                     layer, dispatch_output, staging_buffer
@@ -2625,8 +2763,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
         topk_ids = topk_output.topk_ids
+        t_mask = time.perf_counter()
         masked_topk_ids = mask_and_remap_expert_ids(
             topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
+        )
+        _kt_log_timing(
+            self,
+            "kt.mask_remap_enqueue",
+            t_mask,
+            tokens=num_tokens,
+            topk=tuple(topk_ids.shape),
         )
 
         # Create modified dispatch output for GPU computation
@@ -2637,7 +2783,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 3: Execute GPU expert computation on main stream
         # No wait needed - staging buffer decouples CPU and GPU data access
+        t_gpu = time.perf_counter()
         gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+        _kt_log_timing(
+            self,
+            "kt.gpu_apply_enqueue",
+            t_gpu,
+            tokens=num_tokens,
+        )
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         output = gpu_combine_input.hidden_states
@@ -2645,11 +2798,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             with torch.cuda.stream(self._cpu_stream):
                 # Use staging_buffer for sync to get correct buffer reference
                 cpu_output = self._sync_with_staged_input(staging_buffer)
+                if cpu_timing_end_event is not None:
+                    cpu_timing_end_event.record(self._cpu_stream)
                 self._sync_done_event.record(self._cpu_stream)
 
             # Main stream waits for cpu_stream to complete before merging results
+            t_wait_event = time.perf_counter()
             torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+            _kt_log_timing(
+                self,
+                "kt.main_wait_cpu_event_enqueue",
+                t_wait_event,
+                tokens=num_tokens,
+            )
+            if cpu_timing_start_event is not None and cpu_timing_end_event is not None:
+                cpu_timing_end_event.synchronize()
+                _kt_log_timing(
+                    self,
+                    "kt.cpu_stream_elapsed",
+                    tokens=num_tokens,
+                    elapsed_ms=(
+                        f"{cpu_timing_start_event.elapsed_time(cpu_timing_end_event):.3f}"
+                    ),
+                )
+            t_merge = time.perf_counter()
             output = output + cpu_output
+            _kt_log_timing(
+                self,
+                "kt.merge_enqueue",
+                t_merge,
+                tokens=num_tokens,
+            )
 
         return StandardCombineInput(hidden_states=output)
 

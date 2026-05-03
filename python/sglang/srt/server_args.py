@@ -5491,10 +5491,15 @@ class ServerArgs:
         if self.pp_size > 1:
             # DFLASH speculative decoding has a dedicated PP-aware path
             # (drafter-on-last-rank, see DFlashWorker). All other speculative
-            # algorithms still require pp_size == 1.
+            # algorithms still require pp_size == 1. DFLASH spec-v2 enables
+            # overlap scheduling, so do not reject overlap for that path here.
             speculative_pp_compatible = self.speculative_algorithm in (None, "DFLASH")
-            assert (
+            overlap_pp_compatible = (
                 self.disable_overlap_schedule
+                or self.speculative_algorithm == "DFLASH"
+            )
+            assert (
+                overlap_pp_compatible
                 and speculative_pp_compatible
                 and not self.enable_mixed_chunk
             ), "Pipeline parallelism is not compatible with overlap schedule, non-DFLASH speculative decoding, mixed chunked prefill."

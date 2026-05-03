@@ -939,9 +939,10 @@ class CudaGraphRunner:
                 self.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(forward).parameters
             ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                )
+                # CUDA graphs must read from stable replay-updated buffers. Cloning
+                # here captures a one-time copy of the PP carrier and makes later
+                # replays consume stale hidden states.
+                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             if (
                 self.model_runner.spec_algorithm.is_dflash()
                 and self.model_runner.is_draft_worker
@@ -1095,17 +1096,66 @@ class CudaGraphRunner:
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
-            # In speculative decoding, these two fields are still needed.
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            # The caller already initialized attention metadata through
+            # replay_prepare. Keep the graph input buffers fresh as well, so
+            # overlap/speculative paths cannot replay with stale per-step state.
+            buffers = self.buffers
+            raw_bs = self.raw_bs
+            raw_num_token = self.raw_num_token
+            bs = self.bs
+            if bs != raw_bs:
+                buffers.seq_lens.fill_(self.seq_len_fill_value)
+                buffers.out_cache_loc.zero_()
+                if buffers.mamba_track_indices is not None:
+                    buffers.mamba_track_indices.zero_()
+                if buffers.mamba_track_mask is not None:
+                    buffers.mamba_track_mask.fill_(False)
+                if forward_batch.seq_lens_cpu is not None:
+                    buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+
+            buffers.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+            buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            buffers.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+            buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+            if (
+                buffers.mamba_track_indices is not None
+                and forward_batch.mamba_track_indices is not None
+            ):
+                buffers.mamba_track_indices[:raw_bs].copy_(
+                    forward_batch.mamba_track_indices
+                )
+            if (
+                buffers.mamba_track_mask is not None
+                and forward_batch.mamba_track_mask is not None
+            ):
+                buffers.mamba_track_mask[:raw_bs].copy_(forward_batch.mamba_track_mask)
+            if forward_batch.seq_lens_cpu is not None:
+                buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            if buffers.encoder_lens is not None and forward_batch.encoder_lens is not None:
+                buffers.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
+            if forward_batch.mrope_positions is not None:
+                buffers.mrope_positions[:, :raw_num_token].copy_(
+                    forward_batch.mrope_positions
+                )
+            if self.require_gathered_buffer:
+                buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
+                buffers.global_num_tokens_for_logprob_gpu.fill_(
+                    bs * self.num_tokens_per_bs
+                )
+            if forward_batch.num_token_non_padded is not None:
+                buffers.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
+
+            if pp_proxy_tensors is not None and buffers.pp_proxy_tensors is not None:
+                for key, buf in buffers.pp_proxy_tensors.items():
+                    src = pp_proxy_tensors.tensors[key]
+                    buf[: src.shape[0]].copy_(src)
             if (
                 self.model_runner.spec_algorithm.is_dflash()
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
-                self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
-                )
+                buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
 
         # Replay
         if self.enable_pdmux:
@@ -1181,21 +1231,20 @@ class CudaGraphRunner:
         elif self.model_runner.spec_algorithm.is_dflash():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
-                resolve_dflash_verify_mask_policy,
+                _get_or_create_chain_verify_buffers,
             )
 
-            # Avoid enabling custom-mask modes during graph capture for backends that
-            # can express DFLASH verify via their built-in causal path.
-            _, build_custom_mask = resolve_dflash_verify_mask_policy(
-                self.model_runner.attn_backend
+            build_custom_mask = not self.model_runner.is_draft_worker
+            draft_token_num = (
+                self.model_runner.server_args.speculative_num_draft_tokens
             )
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=draft_token_num,
                 custom_mask=(
                     None
-                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    if not build_custom_mask
                     else self.buffers.custom_mask
                 ),
                 capture_hidden_mode=(
@@ -1204,6 +1253,22 @@ class CudaGraphRunner:
                     else CaptureHiddenMode.FULL
                 ),
             )
+            if not self.model_runner.is_draft_worker:
+                bs = max(1, num_tokens // max(1, int(draft_token_num)))
+                (
+                    _retrieve_index,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    _predicts,
+                    _accept_index,
+                    _accept_token_num,
+                ) = _get_or_create_chain_verify_buffers(
+                    bs=bs,
+                    draft_token_num=int(draft_token_num),
+                    device=torch.device(self.device),
+                )
+                spec_info.retrive_next_token = retrieve_next_token
+                spec_info.retrive_next_sibling = retrieve_next_sibling
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput

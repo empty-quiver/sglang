@@ -320,15 +320,39 @@ class SchedulerOutputProcessorMixin:
     ) -> List[List[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
         assert result.next_token_ids.is_cpu
+        if result.accept_lens is None:
+            raise RuntimeError("Spec-v2 overlap result is missing accept_lens.")
         assert result.accept_lens.is_cpu
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
+        batch_size = len(batch.reqs)
+        if len(accept_lens) != batch_size:
+            raise RuntimeError(
+                "Spec-v2 overlap accept_lens length mismatch: "
+                f"expected={batch_size}, got={len(accept_lens)}."
+            )
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
+        min_token_ids = stride * batch_size
+        if len(next_token_ids) < min_token_ids:
+            raise RuntimeError(
+                "Spec-v2 overlap next_token_ids length mismatch: "
+                f"expected_at_least={min_token_ids}, got={len(next_token_ids)}, "
+                f"batch_size={batch_size}, stride={stride}."
+            )
+        if batch.spec_algorithm.is_dflash():
+            bad_accept_lens = [
+                int(x) for x in accept_lens if int(x) < 1 or int(x) > stride
+            ]
+            if bad_accept_lens:
+                raise RuntimeError(
+                    "DFLASH spec-v2 accept_lens out of bounds: "
+                    f"values={bad_accept_lens}, stride={stride}."
+                )
 
         for i, req in enumerate(batch.reqs):
             req.kv_committed_len += accept_lens[i]

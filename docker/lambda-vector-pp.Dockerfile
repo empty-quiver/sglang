@@ -189,6 +189,7 @@ ENV UV_LINK_MODE=copy \
     HF_HOME=/root/.cache/huggingface \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     KT_GPTQ_INT4_BACKEND=avxvnni \
+    UV_HTTP_TIMEOUT=300 \
     CC=gcc
 
 # Copy the entire venv from the builder (includes our sm_86+sm_89 sgl-kernel

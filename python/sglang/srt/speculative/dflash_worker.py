@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_cuda,
 )
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,23 @@ class DFlashWorker:
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        self._dflash_gpu_embed_cache_enabled = os.getenv(
+            "SGLANG_DFLASH_GPU_EMBED_CACHE"
+        ) in ("1", "true", "TRUE")
+        self._dflash_gpu_embed_cache_weight: Optional[torch.Tensor] = None
+        self._dflash_gpu_embed_cache_key = None
+        self._dflash_gpu_embed_cache_warned = False
+        self._dflash_async_compact_seq_lens_cpu = os.getenv(
+            "SGLANG_DFLASH_ASYNC_COMPACT_SEQ_LENS_CPU"
+        ) in ("1", "true", "TRUE")
+        self._dflash_validate_compact_seq_lens_cpu = os.getenv(
+            "SGLANG_DFLASH_VALIDATE_COMPACT_SEQ_LENS_CPU"
+        ) in ("1", "true", "TRUE")
+        self._dflash_commit_lens_cpu_buf: Optional[torch.Tensor] = None
+        self._dflash_compact_seq_lens_cpu_buf: Optional[torch.Tensor] = None
+        self._dflash_host_mirror_cap = 0
+        self._dflash_host_mirror_stream = None
+        self._dflash_host_mirror_event = None
 
         # PP topology: only the last PP rank owns the drafter + lm_head.
         # The other ranks should never invoke draft/verify codepaths.
@@ -534,8 +552,223 @@ class DFlashWorker:
             (new_cap,), dtype=torch.int32, device=device
         )
         self._draft_seq_lens_cpu_buf = torch.empty(
-            (new_cap,), dtype=torch.int32, device="cpu"
+            (new_cap,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=is_pin_memory_available(),
         )
+
+    def _dflash_cpu_embed_lookup(
+        self, embed_module: torch.nn.Module, block_ids: torch.Tensor
+    ) -> torch.Tensor:
+        block_ids_cpu = block_ids.to("cpu", non_blocking=False)
+        return embed_module(block_ids_cpu).to(self.device, non_blocking=True)
+
+    def _dflash_embed_block_ids(
+        self, embed_module: torch.nn.Module, block_ids: torch.Tensor
+    ) -> torch.Tensor:
+        embed_weight = getattr(embed_module, "weight", None)
+        if embed_weight is None or embed_weight.device.type != "cpu":
+            return embed_module(block_ids)
+
+        if not self._dflash_gpu_embed_cache_enabled:
+            return self._dflash_cpu_embed_lookup(embed_module, block_ids)
+
+        # Keep this conservative. VocabParallelEmbedding.forward has masking and
+        # all-reduce semantics when TP > 1, and non-unquantized embedding methods
+        # may not be equivalent to F.embedding over a plain weight tensor.
+        quant_method_name = type(
+            getattr(embed_module, "quant_method", None)
+        ).__name__
+        if getattr(embed_module, "tp_size", 1) != 1 or quant_method_name not in (
+            "NoneType",
+            "UnquantizedEmbeddingMethod",
+        ):
+            if not self._dflash_gpu_embed_cache_warned:
+                logger.warning(
+                    "DFLASH GPU embedding cache disabled: unsupported embedding "
+                    "module=%s tp_size=%s quant_method=%s",
+                    type(embed_module).__name__,
+                    getattr(embed_module, "tp_size", None),
+                    quant_method_name,
+                )
+                self._dflash_gpu_embed_cache_warned = True
+            self._dflash_gpu_embed_cache_enabled = False
+            return self._dflash_cpu_embed_lookup(embed_module, block_ids)
+
+        if is_cuda() and torch.cuda.is_current_stream_capturing():
+            return self._dflash_cpu_embed_lookup(embed_module, block_ids)
+
+        cache_key = (
+            int(embed_weight.data_ptr()),
+            tuple(embed_weight.shape),
+            embed_weight.dtype,
+            str(self.device),
+        )
+        if (
+            self._dflash_gpu_embed_cache_weight is None
+            or self._dflash_gpu_embed_cache_key != cache_key
+        ):
+            try:
+                cached_weight = embed_weight.detach().to(
+                    device=self.device, non_blocking=True
+                )
+            except RuntimeError as e:
+                self._dflash_gpu_embed_cache_weight = None
+                self._dflash_gpu_embed_cache_key = None
+                self._dflash_gpu_embed_cache_enabled = False
+                if not self._dflash_gpu_embed_cache_warned:
+                    logger.warning(
+                        "DFLASH GPU embedding cache allocation failed; "
+                        "falling back to CPU lookup: %s",
+                        e,
+                    )
+                    self._dflash_gpu_embed_cache_warned = True
+                return self._dflash_cpu_embed_lookup(embed_module, block_ids)
+
+            self._dflash_gpu_embed_cache_weight = cached_weight
+            self._dflash_gpu_embed_cache_key = cache_key
+            if self.tp_rank == 0:
+                gib = cached_weight.numel() * cached_weight.element_size() / (
+                    1024**3
+                )
+                logger.info(
+                    "DFLASH GPU embedding cache enabled: shape=%s dtype=%s "
+                    "device=%s size_gib=%.3f",
+                    tuple(cached_weight.shape),
+                    cached_weight.dtype,
+                    cached_weight.device,
+                    gib,
+                )
+
+        return torch.nn.functional.embedding(
+            block_ids, self._dflash_gpu_embed_cache_weight
+        )
+
+    def _ensure_dflash_host_mirror_buffers(self, bs: int) -> None:
+        if self._dflash_host_mirror_cap >= int(bs):
+            return
+        new_cap = max(
+            int(bs),
+            self._dflash_host_mirror_cap * 2
+            if self._dflash_host_mirror_cap > 0
+            else int(bs),
+        )
+        self._dflash_commit_lens_cpu_buf = torch.empty(
+            (new_cap,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=is_pin_memory_available(),
+        )
+        self._dflash_compact_seq_lens_cpu_buf = torch.empty(
+            (new_cap,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=is_pin_memory_available(),
+        )
+        self._dflash_host_mirror_cap = new_cap
+
+    def _compute_compact_draft_seq_lens_cpu(
+        self, seq_lens_cpu: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.draft_window_size is not None
+        # `out` is allowed to alias `seq_lens_cpu`; keep an unmodified copy for
+        # the page-alignment calculation below.
+        base_seq_lens = seq_lens_cpu[: out.numel()].to(dtype=torch.int32).clone()
+        out.copy_(base_seq_lens)
+        out.clamp_(max=int(self.draft_window_size))
+        if self.page_size > 1:
+            seq_lens_i64 = base_seq_lens.to(dtype=torch.int64)
+            visible_lens_i64 = out.to(dtype=torch.int64)
+            visible_start = seq_lens_i64 - visible_lens_i64
+            aligned_start = visible_start - torch.remainder(
+                visible_start, self.page_size
+            )
+            out.copy_((seq_lens_i64 - aligned_start).to(dtype=torch.int32))
+        return out
+
+    def _start_dflash_compact_seq_lens_cpu_mirror(
+        self,
+        base_seq_lens_cpu: Optional[torch.Tensor],
+        commit_lens: torch.Tensor,
+    ):
+        if (
+            not self._dflash_async_compact_seq_lens_cpu
+            or base_seq_lens_cpu is None
+            or not is_cuda()
+            or not commit_lens.is_cuda
+        ):
+            return None
+
+        bs = int(commit_lens.numel())
+        self._ensure_dflash_host_mirror_buffers(bs)
+        assert self._dflash_commit_lens_cpu_buf is not None
+        assert self._dflash_compact_seq_lens_cpu_buf is not None
+
+        if (
+            self.page_size <= 1
+            and self.draft_window_size is not None
+            and bool(
+                torch.all(base_seq_lens_cpu[:bs] >= int(self.draft_window_size)).item()
+            )
+        ):
+            compact_seq_lens_cpu = self._dflash_compact_seq_lens_cpu_buf[:bs]
+            compact_seq_lens_cpu.fill_(int(self.draft_window_size))
+            return None, compact_seq_lens_cpu, int(bs * int(self.draft_window_size))
+
+        device_module = torch.get_device_module(self.device)
+        if self._dflash_host_mirror_stream is None:
+            self._dflash_host_mirror_stream = device_module.Stream(device=self.device)
+            self._dflash_host_mirror_event = device_module.Event()
+        assert self._dflash_host_mirror_event is not None
+
+        commit_lens_cpu = self._dflash_commit_lens_cpu_buf[:bs]
+        commit_lens_src = (
+            commit_lens
+            if commit_lens.dtype == torch.int32
+            else commit_lens.to(dtype=torch.int32)
+        )
+        current_stream = device_module.current_stream(self.device)
+        with device_module.stream(self._dflash_host_mirror_stream):
+            self._dflash_host_mirror_stream.wait_stream(current_stream)
+            commit_lens_cpu.copy_(commit_lens_src, non_blocking=True)
+            self._dflash_host_mirror_event.record(self._dflash_host_mirror_stream)
+
+        return (
+            self._dflash_host_mirror_event,
+            base_seq_lens_cpu[:bs],
+            commit_lens_cpu,
+        )
+
+    def _finish_dflash_compact_seq_lens_cpu_mirror(self, mirror):
+        if mirror is None:
+            return None, None
+        event, base_seq_lens_cpu, commit_lens_cpu = mirror
+        if event is None:
+            return base_seq_lens_cpu, int(commit_lens_cpu)
+        event.synchronize()
+        bs = int(commit_lens_cpu.numel())
+        assert self._dflash_compact_seq_lens_cpu_buf is not None
+        compact_seq_lens_cpu = self._dflash_compact_seq_lens_cpu_buf[:bs]
+        compact_seq_lens_cpu.copy_(base_seq_lens_cpu.to(dtype=torch.int32))
+        compact_seq_lens_cpu.add_(commit_lens_cpu)
+        self._compute_compact_draft_seq_lens_cpu(
+            compact_seq_lens_cpu, compact_seq_lens_cpu
+        )
+        return compact_seq_lens_cpu, int(compact_seq_lens_cpu.sum().item())
+
+    def _validate_compact_draft_seq_lens_cpu(
+        self, seq_lens_cpu: torch.Tensor, draft_prefix_lens: torch.Tensor
+    ) -> None:
+        if not self._dflash_validate_compact_seq_lens_cpu:
+            return
+        expected = draft_prefix_lens.detach().to(device="cpu", dtype=torch.int32)
+        if not torch.equal(seq_lens_cpu[: expected.numel()], expected):
+            raise RuntimeError(
+                "DFLASH compact draft seq_lens CPU mirror mismatch: "
+                f"mirror={seq_lens_cpu[: expected.numel()].tolist()} "
+                f"expected={expected.tolist()}"
+            )
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
@@ -844,18 +1077,7 @@ class DFlashWorker:
             block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
 
-            # Memory-saver: when the replicated embed_tokens lives on CPU
-            # (DFlash + PP=2 mem-efficient mode), do the lookup on CPU and
-            # transfer the small result to GPU. block_ids is bs*block_size
-            # ints; result is bs*block_size*hidden_size bf16 (~80 KB at
-            # bs=1, block_size=8). PCIe round-trip is ~50 microseconds —
-            # negligible vs the 2.5 GB freed on PP1.
-            embed_weight = getattr(embed_module, 'weight', None)
-            if embed_weight is not None and embed_weight.device.type == 'cpu':
-                block_ids_cpu = block_ids.to('cpu', non_blocking=False)
-                noise_embedding = embed_module(block_ids_cpu).to(self.device, non_blocking=True)
-            else:
-                noise_embedding = embed_module(block_ids)
+            noise_embedding = self._dflash_embed_block_ids(embed_module, block_ids)
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
             # For spec-v1, the draft KV cache is always materialized before drafting the

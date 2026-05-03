@@ -2106,19 +2106,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
             elif self.spec_algorithm.is_dflash():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+                from sglang.srt.speculative.dflash_utils import (
+                    _get_or_create_chain_verify_buffers,
+                )
 
                 # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+                draft_token_num = self.server_args.speculative_num_draft_tokens
                 spec_info = DFlashVerifyInput(
                     draft_token=None,
                     positions=None,
-                    draft_token_num=self.server_args.speculative_num_draft_tokens,
-                    custom_mask=None,
+                    draft_token_num=draft_token_num,
+                    custom_mask=(
+                        None if self.is_draft_worker else buffers.custom_mask
+                    ),
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL
                         if self.is_draft_worker
                         else CaptureHiddenMode.FULL
                     ),
                 )
+                if not self.is_draft_worker:
+                    bs = max(1, num_tokens // max(1, int(draft_token_num)))
+                    (
+                        _retrieve_index,
+                        retrieve_next_token,
+                        retrieve_next_sibling,
+                        _predicts,
+                        _accept_index,
+                        _accept_token_num,
+                    ) = _get_or_create_chain_verify_buffers(
+                        bs=bs,
+                        draft_token_num=int(draft_token_num),
+                        device=torch.device(self.device),
+                    )
+                    spec_info.retrive_next_token = retrieve_next_token
+                    spec_info.retrive_next_sibling = retrieve_next_sibling
 
             elif self.spec_algorithm.is_ngram():
                 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -2203,9 +2225,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and "pp_proxy_tensors"
                 in inspect.signature(self.model.forward).parameters
             ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                )
+                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             if not self.is_generation:
                 kwargs["get_embedding"] = True
 

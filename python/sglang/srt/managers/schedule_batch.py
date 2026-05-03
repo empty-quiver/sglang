@@ -2017,6 +2017,467 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             verify_done.synchronize()
 
+    @staticmethod
+    def _request_major_first_dim(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            if len(shape) == 0:
+                return None
+            return int(shape[0])
+        if isinstance(value, (list, tuple)):
+            return len(value)
+        return None
+
+    @staticmethod
+    def _debug_shape(value: Any) -> Optional[Tuple[int, ...]]:
+        if value is None:
+            return None
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            return tuple(int(dim) for dim in shape)
+        if isinstance(value, (list, tuple)):
+            return (len(value),)
+        return None
+
+    @staticmethod
+    def _summarize_int_list(
+        values: Optional[Union[List[int], Tuple[int, ...]]], limit: int = 8
+    ) -> Optional[Dict[str, Any]]:
+        if values is None:
+            return None
+        try:
+            length = len(values)
+        except TypeError:
+            return None
+
+        sample = []
+        for value in values[:limit]:
+            try:
+                sample.append(int(value))
+            except (TypeError, ValueError):
+                sample.append(value)
+
+        summary: Dict[str, Any] = {"len": length, "sample": sample}
+        if length == 0:
+            summary.update({"sum": 0, "min": None, "max": None})
+            return summary
+
+        try:
+            int_values = [int(value) for value in values]
+        except (TypeError, ValueError):
+            return summary
+
+        summary.update(
+            {
+                "sum": sum(int_values),
+                "min": min(int_values),
+                "max": max(int_values),
+            }
+        )
+        return summary
+
+    @staticmethod
+    def _req_debug_info(req_or_reqs: Optional[Union[Req, List[Req]]]) -> Any:
+        if req_or_reqs is None:
+            return None
+        if isinstance(req_or_reqs, (list, tuple)):
+            return [
+                ScheduleBatch._req_debug_info(req) for req in req_or_reqs[:8]
+            ]
+
+        req = req_or_reqs
+        info: Dict[str, Any] = {
+            "rid": getattr(req, "rid", None),
+            "req_pool_idx": getattr(req, "req_pool_idx", None),
+            "extend_input_len": getattr(req, "extend_input_len", None),
+        }
+        for attr in ("origin_input_ids", "fill_ids", "output_ids", "prefix_indices"):
+            value = getattr(req, attr, None)
+            if value is not None:
+                info[f"{attr}_len"] = len(value)
+        finished = getattr(req, "finished", None)
+        if callable(finished):
+            try:
+                info["finished"] = bool(finished())
+            except Exception:
+                pass
+        return info
+
+    def _request_major_first_dims(
+        self, *, include_spec_info: bool = True
+    ) -> Dict[str, int]:
+        dims: Dict[str, int] = {}
+
+        def add(name: str, value: Any):
+            dim = self._request_major_first_dim(value)
+            if dim is not None:
+                dims[name] = dim
+
+        for name in (
+            "req_pool_indices",
+            "seq_lens",
+            "seq_lens_cpu",
+            "orig_seq_lens",
+        ):
+            add(name, getattr(self, name, None))
+        if self.output_ids is not None:
+            add("output_ids", self.output_ids)
+
+        for name in (
+            "multimodal_inputs",
+            "encoder_lens",
+            "encoder_lens_cpu",
+            "encoder_cached",
+            "top_logprobs_nums",
+            "token_ids_logprobs",
+            "dimensions",
+        ):
+            value = getattr(self, name, None)
+            if value is not None:
+                add(name, value)
+
+        sampling_info = self.sampling_info
+        if sampling_info is not None:
+            for name in (
+                "temperatures",
+                "top_ps",
+                "top_ks",
+                "min_ps",
+                "sampling_seed",
+                "logit_bias",
+                "custom_params",
+                "grammars",
+                "vocab_mask",
+                "acc_linear_penalties",
+            ):
+                value = getattr(sampling_info, name, None)
+                if value is not None:
+                    add(f"sampling_info.{name}", value)
+
+            custom_logit_processor = getattr(
+                sampling_info, "custom_logit_processor", None
+            )
+            if custom_logit_processor is not None:
+                for key, (_, mask) in custom_logit_processor.items():
+                    add(f"sampling_info.custom_logit_processor[{key}].mask", mask)
+
+            orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
+            if orchestrator is not None and getattr(orchestrator, "is_required", False):
+                for penalizer_cls, penalizer in getattr(
+                    orchestrator, "penalizers", {}
+                ).items():
+                    penalizer_name = getattr(
+                        penalizer_cls, "__name__", str(penalizer_cls)
+                    )
+                    for attr, value in vars(penalizer).items():
+                        if attr.startswith("_"):
+                            continue
+                        add(
+                            f"sampling_info.{penalizer_name}.{attr}",
+                            value,
+                        )
+
+        spec_info = self.spec_info
+        if include_spec_info and spec_info is not None:
+            future_indices = getattr(spec_info, "future_indices", None)
+            if future_indices is not None:
+                add(
+                    "spec_info.future_indices.indices",
+                    getattr(future_indices, "indices", None),
+                )
+                for name in (
+                    "cur_allocated_seq_lens_cpu",
+                    "planning_seq_lens_cpu",
+                    "reserved_seq_lens_cpu",
+                ):
+                    value = getattr(spec_info, name, None)
+                    if value is not None:
+                        add(f"spec_info.{name}", value)
+            else:
+                for name in (
+                    "topk_p",
+                    "topk_index",
+                    "new_seq_lens",
+                    "accept_length",
+                    "seq_lens_for_draft_extend",
+                    "seq_lens_for_draft_extend_cpu",
+                    "req_pool_indices_for_draft_extend",
+                    "cur_allocated_seq_lens_cpu",
+                    "planning_seq_lens_cpu",
+                    "reserved_seq_lens_cpu",
+                ):
+                    value = getattr(spec_info, name, None)
+                    if value is not None:
+                        add(f"spec_info.{name}", value)
+
+        return dims
+
+    def _filter_batch_debug_context(
+        self,
+        keep_indices: Optional[List[int]] = None,
+        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+    ) -> Dict[str, Any]:
+        keep_sample = None
+        keep_max = None
+        keep_len = None
+        if keep_indices is not None:
+            keep_sample = keep_indices[:16]
+            keep_len = len(keep_indices)
+            keep_max = max(keep_indices) if keep_indices else None
+
+        first_dims = self._request_major_first_dims()
+        for name in (
+            "input_ids",
+            "out_cache_loc",
+            "extend_input_logprob_token_ids",
+        ):
+            value = getattr(self, name, None)
+            shape = self._debug_shape(value)
+            if shape is not None:
+                first_dims[name] = shape[0] if len(shape) > 0 else 0
+
+        return {
+            "forward_mode": str(self.forward_mode),
+            "old_num_reqs": len(self.reqs),
+            "first_dims": first_dims,
+            "keep_len": keep_len,
+            "keep_max": keep_max,
+            "keep_sample": keep_sample,
+            "chunked_req": self._req_debug_info(self.chunked_req),
+            "chunked_req_to_exclude": self._req_debug_info(chunked_req_to_exclude),
+            "extend_lens": self._summarize_int_list(self.extend_lens),
+            "prefix_lens": self._summarize_int_list(self.prefix_lens),
+            "rid_sample": [getattr(req, "rid", None) for req in self.reqs[:8]],
+        }
+
+    def _raise_filter_indices_not_request_major(
+        self,
+        keep_indices: List[int],
+        reason: str,
+        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+    ):
+        context = self._filter_batch_debug_context(
+            keep_indices, chunked_req_to_exclude
+        )
+        logger.error(
+            "ScheduleBatch.filter_batch received non-request-major keep_indices: "
+            "reason=%s context=%s",
+            reason,
+            context,
+        )
+        raise RuntimeError(
+            "ScheduleBatch.filter_batch expects request-major keep_indices, "
+            f"but got {reason}. This usually means token-major forward offsets "
+            "were passed to ScheduleBatch.filter_batch; map them to request "
+            f"indices at the caller. context={context}"
+        )
+
+    def _validate_filter_keep_indices_request_major(
+        self,
+        keep_indices: List[int],
+        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+    ):
+        if any(index < 0 for index in keep_indices):
+            self._raise_filter_indices_not_request_major(
+                keep_indices,
+                "negative request index",
+                chunked_req_to_exclude,
+            )
+
+        if not keep_indices:
+            return
+
+        old_num_reqs = len(self.reqs)
+        keep_max = max(keep_indices)
+        if keep_max >= old_num_reqs:
+            self._raise_filter_indices_not_request_major(
+                keep_indices,
+                f"max index {keep_max} >= len(reqs) {old_num_reqs}",
+                chunked_req_to_exclude,
+            )
+
+        core_dims: Dict[str, int] = {}
+        for name in (
+            "req_pool_indices",
+            "seq_lens",
+            "seq_lens_cpu",
+            "orig_seq_lens",
+        ):
+            dim = self._request_major_first_dim(getattr(self, name, None))
+            if dim is not None:
+                core_dims[name] = dim
+        if self.output_ids is not None:
+            dim = self._request_major_first_dim(self.output_ids)
+            if dim is not None:
+                core_dims["output_ids"] = dim
+
+        exceeded_dims = {
+            name: dim for name, dim in core_dims.items() if keep_max >= dim
+        }
+        if exceeded_dims:
+            self._raise_filter_indices_not_request_major(
+                keep_indices,
+                f"max index {keep_max} exceeds request-major first dims "
+                f"{exceeded_dims}",
+                chunked_req_to_exclude,
+            )
+
+    def _validate_request_major_state(
+        self,
+        location: str,
+        expected_len: Optional[int] = None,
+        extra_context: Optional[Dict[str, Any]] = None,
+        include_spec_info: bool = True,
+    ):
+        if expected_len is None:
+            expected_len = len(self.reqs)
+        dims = self._request_major_first_dims(include_spec_info=include_spec_info)
+        mismatches = {
+            name: dim for name, dim in dims.items() if dim != expected_len
+        }
+        if not mismatches:
+            return
+
+        context = self._filter_batch_debug_context()
+        if extra_context:
+            context.update(extra_context)
+        logger.error(
+            "ScheduleBatch request-major invariant violation at %s: "
+            "expected_len=%d mismatches=%s context=%s",
+            location,
+            expected_len,
+            mismatches,
+            context,
+        )
+        raise RuntimeError(
+            "ScheduleBatch request-major invariant violation at "
+            f"{location}: expected first dimension {expected_len} to match "
+            f"len(reqs), mismatches={mismatches}. See logs for context."
+        )
+
+    def _is_spec_v2_active(self) -> bool:
+        return self.spec_algorithm is not None and self.is_spec_v2
+
+    @staticmethod
+    def _filter_tensor_request_rows(
+        tensor: Optional[torch.Tensor],
+        keep_indices: List[int],
+        keep_indices_device: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.device.type == "cpu":
+            return tensor[keep_indices]
+        if keep_indices_device.device != tensor.device:
+            keep_indices_device = keep_indices_device.to(tensor.device)
+        return tensor[keep_indices_device]
+
+    @staticmethod
+    def _filter_list_request_rows(
+        values: Optional[List[Any]], keep_indices: List[int]
+    ) -> Optional[List[Any]]:
+        if values is None:
+            return None
+        return [values[i] for i in keep_indices]
+
+    def _clear_spec_info_request_state(self):
+        spec_info = self.spec_info
+        if spec_info is None:
+            return
+
+        future_indices = getattr(spec_info, "future_indices", None)
+        if future_indices is not None:
+            indices = getattr(future_indices, "indices", None)
+            if isinstance(indices, torch.Tensor):
+                future_indices.indices = indices[:0]
+
+        for name in (
+            "topk_p",
+            "topk_index",
+            "verified_id",
+            "new_seq_lens",
+            "accept_length",
+            "hidden_states",
+            "seq_lens_for_draft_extend",
+            "seq_lens_for_draft_extend_cpu",
+            "req_pool_indices_for_draft_extend",
+            "cur_allocated_seq_lens_cpu",
+            "planning_seq_lens_cpu",
+            "reserved_seq_lens_cpu",
+        ):
+            value = getattr(spec_info, name, None)
+            if isinstance(value, torch.Tensor):
+                setattr(spec_info, name, value[:0])
+            elif isinstance(value, list):
+                setattr(spec_info, name, [])
+
+        for name in ("next_candidates", "next_positions"):
+            if hasattr(spec_info, name):
+                setattr(spec_info, name, None)
+
+    def _filter_batch_to_empty(self, has_been_filtered: bool):
+        empty_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.reqs = []
+
+        for name in (
+            "input_ids",
+            "input_embeds",
+            "token_type_ids",
+            "req_pool_indices",
+            "seq_lens",
+            "seq_lens_cpu",
+            "orig_seq_lens",
+            "output_ids",
+            "extend_input_logprob_token_ids",
+            "encoder_lens",
+            "encoder_out_cache_loc",
+            "seq_lens_cpu_cache",
+        ):
+            value = getattr(self, name, None)
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value[:0])
+
+        for name in (
+            "multimodal_inputs",
+            "encoder_lens_cpu",
+            "encoder_cached",
+            "top_logprobs_nums",
+            "token_ids_logprobs",
+            "prefix_lens",
+            "extend_lens",
+            "extend_logprob_start_lens",
+            "decoding_reqs",
+            "dimensions",
+        ):
+            if getattr(self, name, None) is not None:
+                setattr(self, name, [])
+
+        self.out_cache_loc = None
+        self.seq_lens_sum = 0
+        self.extend_num_tokens = 0
+        self.mamba_track_indices = None
+        self.mamba_track_mask = None
+        self.mamba_track_seqlens = None
+        self.return_logprob = False
+        self.has_stream = False
+        self.has_grammar = False
+        self.split_forward_batch = None
+
+        if self.sampling_info is not None:
+            self.sampling_info.filter_batch([], empty_indices)
+            self.sampling_info = None
+
+        if self.spec_info:
+            self.spec_info.filter_batch(
+                new_indices=empty_indices,
+                has_been_filtered=has_been_filtered,
+            )
+            self._clear_spec_info_request_state()
+
+        self._validate_request_major_state("filter_batch.empty")
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -2027,6 +2488,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
+
+        has_been_filtered = v1_spec_info_filtered and not self._is_spec_v2_active()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2039,44 +2502,94 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if not self.reqs[i].finished()
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
+        elif isinstance(keep_indices, torch.Tensor):
+            keep_indices = keep_indices.tolist()
+        else:
+            keep_indices = list(keep_indices)
 
-        if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests
-            self.reqs = []
+        try:
+            keep_indices = [int(index) for index in keep_indices]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "ScheduleBatch.filter_batch expects integer request indices, "
+                f"but got keep_indices={keep_indices}."
+            ) from exc
+
+        if len(keep_indices) == 0:
+            self._filter_batch_to_empty(has_been_filtered)
             return
 
-        if len(keep_indices) == len(self.reqs):
-            # No need to filter
-            return
-
-        keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64).to(
-            self.device, non_blocking=True
+        self._validate_filter_keep_indices_request_major(
+            keep_indices, chunked_req_to_exclude
+        )
+        self._validate_request_major_state(
+            "filter_batch.before",
+            extra_context={"keep_indices": keep_indices[:16]},
+            include_spec_info=not has_been_filtered,
         )
 
-        if self.model_config.is_encoder_decoder:
-            self.encoder_lens = self.encoder_lens[keep_indices_device]
-            self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
+        if keep_indices == list(range(len(self.reqs))):
+            # No need to filter.
+            return
+
+        keep_indices_device = torch.tensor(
+            keep_indices, dtype=torch.int64, device=self.device
+        )
+
+        if self.model_config is not None and self.model_config.is_encoder_decoder:
+            self.encoder_lens = self._filter_tensor_request_rows(
+                self.encoder_lens, keep_indices, keep_indices_device
+            )
+            self.encoder_lens_cpu = self._filter_list_request_rows(
+                self.encoder_lens_cpu, keep_indices
+            )
+            self.encoder_cached = self._filter_list_request_rows(
+                self.encoder_cached, keep_indices
+            )
 
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
-            self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
-        self.seq_lens = self.seq_lens[keep_indices_device]
-        self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
-        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+            self.multimodal_inputs = self._filter_list_request_rows(
+                self.multimodal_inputs, keep_indices
+            )
+        if self.dimensions is not None:
+            self.dimensions = self._filter_list_request_rows(
+                self.dimensions, keep_indices
+            )
+
+        self.req_pool_indices = self._filter_tensor_request_rows(
+            self.req_pool_indices, keep_indices, keep_indices_device
+        )
+        self.seq_lens = self._filter_tensor_request_rows(
+            self.seq_lens, keep_indices, keep_indices_device
+        )
+        self.seq_lens_cpu = self._filter_tensor_request_rows(
+            self.seq_lens_cpu, keep_indices, keep_indices_device
+        )
+        self.orig_seq_lens = self._filter_tensor_request_rows(
+            self.orig_seq_lens, keep_indices, keep_indices_device
+        )
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        self.seq_lens_sum = (
+            self.seq_lens.sum().item() if self.seq_lens is not None else 0
+        )
 
         if self.output_ids is not None:
-            self.output_ids = self.output_ids[keep_indices_device]
+            self.output_ids = self._filter_tensor_request_rows(
+                self.output_ids, keep_indices, keep_indices_device
+            )
 
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
-            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
-            self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
+            self.top_logprobs_nums = self._filter_list_request_rows(
+                self.top_logprobs_nums, keep_indices
+            )
+            self.token_ids_logprobs = self._filter_list_request_rows(
+                self.token_ids_logprobs, keep_indices
+            )
         else:
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
@@ -2084,11 +2597,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
 
-        self.sampling_info.filter_batch(keep_indices, keep_indices_device)
-        # NOTE: spec_info filtered before batch filtering only happens in:
-        # - Spec v1's verify phase
-        # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
+        if self.sampling_info is not None:
+            self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+            self.sampling_info.grammars = (
+                [req.grammar for req in self.reqs] if self.has_grammar else None
+            )
+            self.sampling_info.vocab_mask = None
+            self.sampling_info.apply_mask_func = None
+            self.sampling_info.acc_linear_penalties = None
 
         if self.spec_info:
             self.spec_info.filter_batch(
@@ -2096,10 +2612,84 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered=has_been_filtered,
             )
 
+        self._validate_request_major_state(
+            "filter_batch.after",
+            extra_context={"keep_indices": keep_indices[:16]},
+        )
+
+    def _validate_merge_batch_compatible(self, other: "ScheduleBatch"):
+        problems: List[str] = []
+
+        if self.sampling_info is None or other.sampling_info is None:
+            problems.append(
+                "sampling_info presence mismatch: "
+                f"left={self.sampling_info is not None}, "
+                f"right={other.sampling_info is not None}"
+            )
+
+        if (self.output_ids is None) != (other.output_ids is None):
+            problems.append(
+                "output_ids presence mismatch: "
+                f"left={self.output_ids is not None}, "
+                f"right={other.output_ids is not None}"
+            )
+
+        if self.spec_info is None and other.spec_info is not None:
+            problems.append("left spec_info is None but right spec_info is present")
+        elif self.spec_info is not None and other.spec_info is None:
+            problems.append("left spec_info is present but right spec_info is None")
+        elif (
+            self.spec_info is not None
+            and other.spec_info is not None
+            and type(self.spec_info) is not type(other.spec_info)
+        ):
+            problems.append(
+                "spec_info type mismatch: "
+                f"left={type(self.spec_info).__name__}, "
+                f"right={type(other.spec_info).__name__}"
+            )
+
+        if self.model_config is not None and self.model_config.is_encoder_decoder:
+            for name in ("encoder_lens", "encoder_lens_cpu", "encoder_cached"):
+                if (getattr(self, name, None) is None) != (
+                    getattr(other, name, None) is None
+                ):
+                    problems.append(
+                        f"{name} presence mismatch: "
+                        f"left={getattr(self, name, None) is not None}, "
+                        f"right={getattr(other, name, None) is not None}"
+                    )
+
+        if problems:
+            logger.error(
+                "ScheduleBatch.merge_batch incompatible request-major state: "
+                "problems=%s left=%s right=%s",
+                problems,
+                self._filter_batch_debug_context(),
+                other._filter_batch_debug_context(),
+            )
+            raise RuntimeError(
+                "ScheduleBatch.merge_batch incompatible request-major state: "
+                f"{problems}"
+            )
+
     def merge_batch(self, other: "ScheduleBatch"):
         # NOTE: in spec v2 mode, we do not need wait verify here because
         # 1) current batch is always prefill, whose seq_lens is not a future
         # 2) other batch is always decode, which is finished in previous step
+        self._validate_request_major_state("merge_batch.left.before")
+        other._validate_request_major_state("merge_batch.right.before")
+
+        left_bs = len(self.reqs)
+        right_bs = len(other.reqs)
+        if left_bs == 0:
+            self.__dict__.update(other.__dict__)
+            self._validate_request_major_state("merge_batch.empty_left.after")
+            return
+        if right_bs == 0:
+            return
+
+        self._validate_merge_batch_compatible(other)
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2110,6 +2700,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
+            self.encoder_cached.extend(other.encoder_cached)
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
@@ -2127,11 +2718,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
         elif self.return_logprob:
-            self.top_logprobs_nums.extend([0] * len(other.reqs))
-            self.token_ids_logprobs.extend([None] * len(other.reqs))
+            self.top_logprobs_nums.extend([0] * right_bs)
+            self.token_ids_logprobs.extend([None] * right_bs)
         elif other.return_logprob:
-            self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
-            self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
+            self.top_logprobs_nums = [0] * left_bs + other.top_logprobs_nums
+            self.token_ids_logprobs = [None] * left_bs + other.token_ids_logprobs
+
+        if self.dimensions is not None or other.dimensions is not None:
+            left_dimensions = (
+                self.dimensions or [self.model_config.hidden_size] * left_bs
+            )
+            right_dimensions = (
+                other.dimensions or [other.model_config.hidden_size] * right_bs
+            )
+            self.dimensions = left_dimensions + right_dimensions
+
         self.reqs.extend(other.reqs)
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
@@ -2141,8 +2742,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
 
+        if self.sampling_info is not None:
+            self.sampling_info.grammars = (
+                [req.grammar for req in self.reqs] if self.has_grammar else None
+            )
+            self.sampling_info.vocab_mask = None
+            self.sampling_info.apply_mask_func = None
+            self.sampling_info.acc_linear_penalties = None
+
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+
+        self._validate_request_major_state(
+            "merge_batch.after",
+            expected_len=left_bs + right_bs,
+        )
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None

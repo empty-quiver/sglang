@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -215,6 +216,12 @@ class DFlashVerifyInput(SpecInput):
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
+    # Chain metadata for recurrent/linear-attention target-verify kernels.
+    # DFLASH uses a single linear chain, but the GDN/Mamba kernels share the
+    # EAGLE tree path and need this metadata to advance intermediate states
+    # from token i to token i + 1 during verify.
+    retrive_next_token: torch.Tensor | None = None
+    retrive_next_sibling: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
@@ -325,10 +332,33 @@ class DFlashVerifyInput(SpecInput):
         )
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        # Overlap scheduling mutates the ModelWorkerBatch for the next step while
+        # the target verify forward can still be queued. Snapshot the small
+        # verify tensors used by CUDA graph replay so replay_prepare and replay
+        # consume one immutable view of this step.
+        for attr in (
+            "input_ids",
+            "req_pool_indices",
+            "seq_lens",
+            "seq_lens_cpu",
+            "orig_seq_lens",
+            "out_cache_loc",
+            "positions",
+            "mrope_positions",
+            "mamba_track_indices",
+            "mamba_track_mask",
+        ):
+            value = getattr(verify_forward_batch, attr, None)
+            if isinstance(value, torch.Tensor):
+                setattr(verify_forward_batch, attr, value.clone())
 
+        target_cuda_graph_disabled = os.getenv(
+            "SGLANG_DFLASH_DISABLE_TARGET_CUDA_GRAPH"
+        ) in ("1", "true", "TRUE")
         can_run_cuda_graph = bool(
             target_worker.model_runner.graph_runner
             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+            and not target_cuda_graph_disabled
         )
         if can_run_cuda_graph:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)

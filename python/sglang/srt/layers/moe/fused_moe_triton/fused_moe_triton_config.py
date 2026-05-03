@@ -16,6 +16,17 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 
+def _get_moe_config_device_name() -> str:
+    device_name_override = os.environ.get("SGLANG_MOE_CONFIG_DEVICE_NAME")
+    if device_name_override:
+        return device_name_override
+
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return get_device_name(torch.cuda.current_device())
+
+    return get_device_name()
+
+
 def get_config_file_name(
     E: int,
     N: int,
@@ -24,7 +35,7 @@ def get_config_file_name(
     per_channel_quant: bool = False,
     down_moe: bool = False,
 ) -> str:
-    device_name = get_device_name().replace(" ", "_")
+    device_name = _get_moe_config_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"

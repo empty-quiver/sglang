@@ -130,6 +130,11 @@ class FutureMap:
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
+            if self.spec_algo.is_dflash() and draft_input.future_indices is None:
+                # DFlash PP can receive concrete next-candidate state through the
+                # PP output ring instead of this rank's FutureMap. In that case
+                # there is nothing to resolve on the local forward stream.
+                return
             indices = draft_input.future_indices.indices
             # The indices tensor was allocated on the default stream but is
             # used here on the forward stream. Meanwhile, the old spec_info
