@@ -81,6 +81,7 @@ _DFLASH_ROUTE_TIMING_PHASES = {
     "pp.coalesce.skip",
     "pp.coalesce.owner",
     "pp.proxy.recv.defer",
+    "pp.idle.defer",
 }
 
 _DFLASH_ROUTE_TIMING_EMPTY_PHASES = {
@@ -92,6 +93,7 @@ _DFLASH_ROUTE_TIMING_EMPTY_PHASES = {
     "pp.output_intent.arbitrate",
     "pp.coalesce.skip",
     "pp.coalesce.owner",
+    "pp.idle.defer",
 }
 
 
@@ -221,6 +223,24 @@ def _dflash_running_mbs_summary(running_mbs: List[ScheduleBatch]):
         }
         for i, batch in enumerate(running_mbs)
         if batch is not None and not batch.is_empty()
+    ]
+
+
+def _dflash_batch_has_unfinished_reqs(batch: Optional[ScheduleBatch]) -> bool:
+    if batch is None or batch.is_empty():
+        return False
+    return any(not req.finished() and not req.is_retracted for req in batch.reqs)
+
+
+def _dflash_slot_live_summary(batches: List[Optional[ScheduleBatch]]):
+    return [
+        {
+            "mb": i,
+            "bs": batch.batch_size(),
+            "rids": _dflash_batch_rids(batch),
+        }
+        for i, batch in enumerate(batches)
+        if _dflash_batch_has_unfinished_reqs(batch)
     ]
 
 
@@ -706,6 +726,19 @@ class SchedulerPPMixin:
                     has_pp_outputs=getattr(self, "pp_outputs", None) is not None,
                     send_output_work=len(getattr(self, "send_output_work", [])),
                     send_proxy_work=len(getattr(self, "send_proxy_work", [])),
+                    send_run_control_work=len(
+                        getattr(self, "send_dflash_run_control_work", [])
+                    ),
+                    send_output_intent_work=len(
+                        getattr(self, "send_dflash_output_intent_work", [])
+                    ),
+                    live_running=_dflash_slot_live_summary(
+                        getattr(self, "running_mbs", [])
+                    ),
+                    live_mbs=_dflash_slot_live_summary(getattr(self, "mbs", [])),
+                    live_last=_dflash_slot_live_summary(
+                        getattr(self, "last_mbs", [])
+                    ),
                 )
                 server_is_idle = False
 
@@ -1123,6 +1156,12 @@ class SchedulerPPMixin:
             return True
         if len(getattr(self, "send_proxy_work", [])) > 0:
             return True
+        for attr in ("running_mbs", "mbs", "last_mbs"):
+            batches = getattr(self, attr, None)
+            if batches is not None and any(
+                _dflash_batch_has_unfinished_reqs(batch) for batch in batches
+            ):
+                return True
         return False
 
     def _pp_dflash_pipeline_slots_enabled(self: Scheduler) -> bool:
