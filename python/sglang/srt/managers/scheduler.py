@@ -2188,6 +2188,51 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.pp_size > 1
+                and self.spec_algorithm is not None
+                and self.spec_algorithm.is_dflash()
+                and os.getenv("SGLANG_DFLASH_PP_EXACT_PREFIX_CACHE")
+                in ("1", "true", "TRUE")
+                and len(req.prefix_indices) > 0
+            ):
+                # In DFlash PP with hybrid Mamba/HiCache, partial radix hits can
+                # be present on one pipeline rank but not another because Mamba
+                # state snapshots are only valid at selected cache nodes. Until
+                # prefix-hit consensus is implemented, keep only exact prefix
+                # hits so all ranks agree on the prefill token count.
+                max_prefix_len = max(len(req.fill_ids) - 1, 0)
+                if req.return_logprob and req.logprob_start_len >= 0:
+                    max_prefix_len = min(max_prefix_len, req.logprob_start_len)
+                if len(req.prefix_indices) < max_prefix_len:
+                    if not getattr(
+                        self, "dflash_pp_exact_prefix_cache_warned", False
+                    ):
+                        logger.warning(
+                            "DFLASH PP exact-prefix-cache mode is dropping "
+                            "partial prefix hits to keep PP ranks synchronized."
+                        )
+                        self.dflash_pp_exact_prefix_cache_warned = True
+                    if (
+                        getattr(req, "mamba_pool_idx", None) is not None
+                        and hasattr(self.req_to_token_pool, "mamba_pool")
+                    ):
+                        # `match_prefix(..., cow_mamba=True)` can copy a cached
+                        # Mamba state before the request has a req-pool slot. Do
+                        # not call the full request-pool free path here because
+                        # it also frees per-req ping-pong buffers via
+                        # req.req_pool_idx, which is still unset.
+                        self.req_to_token_pool.mamba_pool.free(
+                            req.mamba_pool_idx.unsqueeze(0)
+                        )
+                        req.mamba_pool_idx = None
+                    req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+                    req.last_node = self.tree_cache.root_node
+                    req.last_host_node = self.tree_cache.root_node
+                    req.host_hit_length = 0
+                    req.cache_protected_len = 0
+                    req.mamba_branching_seqlen = None
+                    req.set_extend_input_len(len(req.fill_ids))
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
