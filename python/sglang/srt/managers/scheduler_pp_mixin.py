@@ -306,6 +306,7 @@ class PPBatchMetadata:
     forward_mode: int = -1
     rid_hashes: Tuple[int, ...] = ()
     token_count: int = -1
+    mamba_cache_indices: Optional[torch.Tensor] = None
 
 
 def _dflash_validate_local_pp_metadata(
@@ -340,6 +341,26 @@ def _dflash_validate_local_pp_metadata(
             "DFLASH PP local route metadata is stale before follower commit: "
             + ", ".join(route_mismatch)
         )
+
+
+def _dflash_clone_current_mamba_cache_indices(
+    scheduler,
+) -> Optional[torch.Tensor]:
+    """Snapshot the route-local Mamba request indices for a later PP commit."""
+    worker = (
+        getattr(scheduler, "draft_worker", None)
+        or getattr(scheduler, "model_worker", None)
+        or getattr(scheduler, "tp_worker", None)
+    )
+    target_worker = getattr(worker, "target_worker", None)
+    model_runner = getattr(target_worker, "model_runner", None)
+    attn_backend = getattr(model_runner, "attn_backend", None)
+    linear_attn_backend = getattr(attn_backend, "linear_attn_backend", None)
+    forward_metadata = getattr(linear_attn_backend, "forward_metadata", None)
+    mamba_cache_indices = getattr(forward_metadata, "mamba_cache_indices", None)
+    if mamba_cache_indices is None:
+        return None
+    return mamba_cache_indices.clone()
 
 
 class SchedulerPPMixin:
@@ -2353,6 +2374,7 @@ class SchedulerPPMixin:
                 batch.output_ids = next_token_ids
             self._pp_dflash_apply_follower_commit(
                 batch=batch,
+                mb_metadata=mb_metadata,
                 commit_lens=dflash_commit_lens,
                 committed_tokens=dflash_committed_tokens,
                 next_candidates=dflash_next_candidates,
@@ -2390,6 +2412,7 @@ class SchedulerPPMixin:
     def _pp_dflash_apply_follower_commit(
         self: Scheduler,
         batch: ScheduleBatch,
+        mb_metadata: PPBatchMetadata,
         commit_lens: Optional[torch.Tensor],
         committed_tokens: Optional[torch.Tensor],
         next_candidates: Optional[torch.Tensor],
@@ -2476,6 +2499,7 @@ class SchedulerPPMixin:
                         batch=batch,
                         seq_lens_pre_verify=seq_lens_pre_verify,
                         commit_lens=commit_lens,
+                        mamba_cache_indices=mb_metadata.mamba_cache_indices,
                     )
                 batch.forward_mode = ForwardMode.DECODE
 
@@ -2550,6 +2574,7 @@ class SchedulerPPMixin:
                     batch=batch,
                     seq_lens_pre_verify=seq_lens_pre_verify,
                     commit_lens=commit_lens,
+                    mamba_cache_indices=mb_metadata.mamba_cache_indices,
                 )
 
             # Mirror PP1's `batch.forward_mode = ForwardMode.DECODE` reset
@@ -2845,6 +2870,11 @@ class SchedulerPPMixin:
                     forward_mode=route_metadata["forward_mode"],
                     rid_hashes=route_metadata["rid_hashes"],
                     token_count=route_metadata["token_count"],
+                    mamba_cache_indices=(
+                        _dflash_clone_current_mamba_cache_indices(self)
+                        if self._pp_dflash_run_control_enabled()
+                        else None
+                    ),
                 )
                 mb_metadata[mb_id] = metadata
                 _dflash_log_timeline(

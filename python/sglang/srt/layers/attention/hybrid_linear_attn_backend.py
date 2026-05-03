@@ -889,6 +889,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
+        mamba_cache_indices: Optional[torch.Tensor] = None,
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
@@ -901,11 +902,24 @@ class HybridLinearAttnBackend(AttentionBackend):
         """
         request_number = accepted_steps.shape[0]
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if mamba_cache_indices is None:
+            forward_metadata = self.linear_attn_backend.forward_metadata
+            mamba_cache_indices = getattr(
+                forward_metadata, "mamba_cache_indices", None
+            )
+        if mamba_cache_indices is None:
+            raise RuntimeError(
+                "Missing Mamba cache indices for MTP verify state commit."
+            )
+        if int(mamba_cache_indices.shape[0]) < request_number:
+            raise RuntimeError(
+                "Mamba cache index count is smaller than accepted-step count: "
+                f"indices={int(mamba_cache_indices.shape[0])}, "
+                f"accepted_steps={request_number}."
+            )
+        state_indices_tensor = mamba_cache_indices[:request_number]
+        if state_indices_tensor.device != accepted_steps.device:
+            state_indices_tensor = state_indices_tensor.to(accepted_steps.device)
 
         mamba_caches = (
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()

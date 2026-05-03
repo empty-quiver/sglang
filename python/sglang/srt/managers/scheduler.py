@@ -2042,7 +2042,12 @@ class Scheduler(
             and getattr(self, "spec_algorithm", None) is not None
             and self.spec_algorithm.is_dflash()
         ):
-            res = min(res, max(1 - running_bs, 0))
+            if os.getenv("SGLANG_DFLASH_PP_PIPELINE_SLOT_COALESCE") not in (
+                "1",
+                "true",
+                "TRUE",
+            ):
+                res = min(res, max(1 - running_bs, 0))
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res

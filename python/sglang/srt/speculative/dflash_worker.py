@@ -1834,6 +1834,7 @@ class DFlashWorker:
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
         commit_lens: torch.Tensor,
+        mamba_cache_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
 
@@ -1872,6 +1873,7 @@ class DFlashWorker:
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
+            mamba_cache_indices=mamba_cache_indices,
         )
 
     def forward_batch_generation(
