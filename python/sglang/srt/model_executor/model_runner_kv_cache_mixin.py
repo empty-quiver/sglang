@@ -478,6 +478,22 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
+                if hasattr(self, "turboquant_bits"):
+                    from sglang.srt.mem_cache.memory_pool import (
+                        MHATokenToKVPoolTurboQuant,
+                    )
+
+                    kwargs["token_to_kv_pool_class"] = MHATokenToKVPoolTurboQuant
+                    kwargs["turboquant_bits"] = self.turboquant_bits
+                    kwargs["turboquant_k_bits"] = getattr(
+                        self, "turboquant_k_bits", 0
+                    )
+                    kwargs["turboquant_v_bits"] = getattr(
+                        self, "turboquant_v_bits", 0
+                    )
+                    kwargs["turboquant_uniform"] = getattr(
+                        self, "turboquant_uniform", False
+                    )
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
