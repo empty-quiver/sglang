@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+from sglang.srt.layers.moe.kt_staging_controller import KTStagingController
 from sglang.srt.utils import get_compiler_backend, is_cuda
 
 if is_cuda():
@@ -231,6 +232,13 @@ _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
 _KT_FULL_GPU_FALLBACK_DISABLED = False
 _KT_STAGING_PROBE_METHODS = []
 _KT_STAGING_PROBE_CURSOR = 0
+_KT_STAGING_PROBE_GLOBAL_SWAPS = 0
+_KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS = 0.0
+_KT_STAGING_PROBE_DEVICE_SWAP_EMA_MS: Dict[str, float] = {}
+_KT_STAGING_PROBE_GLOBAL_MATERIALIZE_EMA_MS = 0.0
+_KT_STAGING_PROBE_GLOBAL_MATERIALIZE_WAIT_EMA_MS = 0.0
+_KT_STAGING_PROBE_GLOBAL_OBSERVATIONS = 0
+_KT_STAGING_PROBE_GLOBAL_LAST_RESET_OBSERVATIONS = 0
 _KT_STAGING_PROBE_WEIGHT_NAMES_WNA16 = [
     "w13_qweight",
     "w13_scales",
@@ -256,6 +264,234 @@ def _kt_staging_swap_limit() -> int:
         return 1
 
 
+def _kt_staging_global_swap_limit() -> int:
+    raw = os.getenv("SGLANG_KT_STAGING_GLOBAL_SWAP_LIMIT", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Invalid SGLANG_KT_STAGING_GLOBAL_SWAP_LIMIT=%r; using 0", raw)
+        return 0
+
+
+def _kt_staging_policy() -> str:
+    raw = os.getenv("SGLANG_KT_STAGING_POLICY")
+    if raw is not None:
+        return raw.strip().lower()
+    if _kt_staging_swap_enabled():
+        return "runtime"
+    return "round_robin"
+
+
+def _kt_staging_runtime_min_score() -> float:
+    raw = os.getenv("SGLANG_KT_STAGING_RUNTIME_MIN_SCORE", "1")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_STAGING_RUNTIME_MIN_SCORE=%r; using 1", raw
+        )
+        return 1.0
+
+
+def _kt_staging_runtime_min_effective_score() -> float:
+    raw = os.getenv("SGLANG_KT_STAGING_RUNTIME_MIN_EFFECTIVE_SCORE", "4")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_STAGING_RUNTIME_MIN_EFFECTIVE_SCORE=%r; using 4",
+            raw,
+        )
+        return 4.0
+
+
+def _kt_staging_runtime_decay() -> float:
+    raw = os.getenv("SGLANG_KT_STAGING_RUNTIME_DECAY", "0.98")
+    try:
+        return min(1.0, max(0.0, float(raw)))
+    except ValueError:
+        logger.warning("Invalid SGLANG_KT_STAGING_RUNTIME_DECAY=%r; using 0.98", raw)
+        return 0.98
+
+
+def _kt_staging_runtime_min_tokens() -> int:
+    raw = os.getenv("SGLANG_KT_STAGING_RUNTIME_MIN_TOKENS", "64")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Invalid SGLANG_KT_STAGING_RUNTIME_MIN_TOKENS=%r; using 64", raw)
+        return 64
+
+
+def _kt_staging_runtime_cost_aware() -> bool:
+    return os.getenv("SGLANG_KT_STAGING_RUNTIME_COST_AWARE", "1") not in (
+        "0",
+        "false",
+        "FALSE",
+    )
+
+
+def _kt_staging_runtime_layer_fairness_enabled() -> bool:
+    return os.getenv("SGLANG_KT_STAGING_RUNTIME_LAYER_FAIRNESS", "1") not in (
+        "0",
+        "false",
+        "FALSE",
+    )
+
+
+def _kt_staging_runtime_layer_swap_penalty() -> float:
+    raw = os.getenv("SGLANG_KT_STAGING_RUNTIME_LAYER_SWAP_PENALTY", "4")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_STAGING_RUNTIME_LAYER_SWAP_PENALTY=%r; using 4",
+            raw,
+        )
+        return 4.0
+
+
+def _kt_staging_runtime_materialize_cost_weight() -> float:
+    raw = os.getenv("SGLANG_KT_STAGING_RUNTIME_MATERIALIZE_COST_WEIGHT", "0")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_STAGING_RUNTIME_MATERIALIZE_COST_WEIGHT=%r; "
+            "using 0",
+            raw,
+        )
+        return 0.0
+
+
+def _kt_staging_runtime_commit_margin() -> float:
+    raw = os.getenv("SGLANG_KT_STAGING_RUNTIME_COMMIT_MARGIN", "1.0")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_STAGING_RUNTIME_COMMIT_MARGIN=%r; using 1.0",
+            raw,
+        )
+        return 1.0
+
+
+def _parse_kt_device_rules(raw: Optional[str]) -> List[Tuple[str, float]]:
+    if raw is None or not raw.strip():
+        return []
+    out: List[Tuple[str, float]] = []
+    for spec in raw.split(";"):
+        spec = spec.strip()
+        if not spec:
+            continue
+        if ":" not in spec:
+            logger.warning(
+                "Invalid KT staging device rule %r; expected name:value", spec
+            )
+            continue
+        name, value = spec.rsplit(":", 1)
+        name = name.strip().lower()
+        if not name:
+            continue
+        try:
+            out.append((name, float(value.strip())))
+        except ValueError:
+            logger.warning("Invalid KT staging device rule value in %r", spec)
+    return out
+
+
+def _kt_staging_runtime_device_rule_value(
+    env_name: str,
+    device_name: str,
+) -> Optional[float]:
+    device_name = device_name.lower()
+    for needle, value in _parse_kt_device_rules(os.getenv(env_name)):
+        if needle in device_name:
+            return value
+    return None
+
+
+def _parse_kt_device_name_rules(raw: Optional[str]) -> List[str]:
+    if raw is None or not raw.strip():
+        return []
+    return [item.strip().lower() for item in raw.split(";") if item.strip()]
+
+
+def _kt_staging_runtime_device_disabled(device_name: str) -> bool:
+    device_name = device_name.lower()
+    for needle in _parse_kt_device_name_rules(
+        os.getenv("SGLANG_KT_STAGING_RUNTIME_DISABLE_DEVICES")
+    ):
+        if needle in device_name:
+            return True
+    return False
+
+
+def _kt_staging_probe_device_key(device_name: str) -> str:
+    return " ".join(device_name.lower().split()) or "unknown"
+
+
+def _kt_runtime_expert_stats_enabled() -> bool:
+    if os.getenv("SGLANG_KT_RUNTIME_EXPERT_STATS") in ("1", "true", "TRUE"):
+        return True
+    return _kt_staging_policy() == "runtime" and _kt_staging_probe_enabled()
+
+
+def _kt_runtime_graph_stats_enabled() -> bool:
+    return _kt_runtime_expert_stats_enabled() and os.getenv(
+        "SGLANG_KT_RUNTIME_GRAPH_STATS", "1"
+    ) not in ("0", "false", "FALSE")
+
+
+def _kt_runtime_graph_stats_sync_interval_s() -> float:
+    raw = os.getenv("SGLANG_KT_RUNTIME_GRAPH_STATS_SYNC_INTERVAL_MS", "250")
+    try:
+        return max(0.0, float(raw) / 1000.0)
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_RUNTIME_GRAPH_STATS_SYNC_INTERVAL_MS=%r; using 250",
+            raw,
+        )
+        return 0.250
+
+
+def _kt_runtime_stats_log_interval_observations() -> int:
+    raw = os.getenv("SGLANG_KT_RUNTIME_STATS_LOG_INTERVAL", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_RUNTIME_STATS_LOG_INTERVAL=%r; using 0",
+            raw,
+        )
+        return 0
+
+
+def _kt_staging_probe_global_at_limit() -> bool:
+    limit = _kt_staging_global_swap_limit()
+    return limit > 0 and _KT_STAGING_PROBE_GLOBAL_SWAPS >= limit
+
+
+def _kt_staging_reset_global_swaps_on_observation() -> bool:
+    return os.getenv("SGLANG_KT_STAGING_RESET_GLOBAL_SWAPS_ON_OBSERVATION") in (
+        "1",
+        "true",
+        "TRUE",
+    )
+
+
+def _kt_staging_global_swap_reset_observations() -> int:
+    raw = os.getenv("SGLANG_KT_STAGING_GLOBAL_SWAP_RESET_OBSERVATIONS", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_KT_STAGING_GLOBAL_SWAP_RESET_OBSERVATIONS=%r; using 0",
+            raw,
+        )
+        return 0
+
+
 def _parse_int_set(raw: Optional[str]) -> Optional[set]:
     if raw is None or not raw.strip():
         return None
@@ -279,6 +515,12 @@ def _kt_staging_probe_layers() -> Optional[set]:
 def _kt_staging_probe_log(phase: str, **fields) -> None:
     if not _kt_staging_probe_enabled():
         return
+    if phase in (
+        "no_candidate",
+        "runtime_no_candidate",
+        "runtime_no_global_candidate",
+    ) and os.getenv("SGLANG_KT_STAGING_PROBE_VERBOSE") not in ("1", "true", "TRUE"):
+        return
     parts = [f"phase={phase}"]
     for key, value in fields.items():
         parts.append(f"{key}={value}")
@@ -290,6 +532,61 @@ def _register_kt_staging_probe_method(method) -> None:
         _KT_STAGING_PROBE_METHODS.append(method)
 
 
+def _select_kt_staging_probe_method(eligible: List[object]):
+    """Select the next KT staging method from the full eligible cohort."""
+    global _KT_STAGING_PROBE_CURSOR
+
+    if _kt_staging_policy() != "runtime":
+        method = eligible[_KT_STAGING_PROBE_CURSOR % len(eligible)]
+        _KT_STAGING_PROBE_CURSOR += 1
+        return method
+
+    pending = [
+        method
+        for method in eligible
+        if getattr(method, "_kt_staging_probe_pending", None) is not None
+    ]
+    if pending:
+        method = pending[_KT_STAGING_PROBE_CURSOR % len(pending)]
+        _KT_STAGING_PROBE_CURSOR += 1
+        return method
+
+    scored = []
+    for method in eligible:
+        if _kt_staging_probe_global_at_limit():
+            break
+        method._kt_sync_runtime_graph_counters_if_needed()
+        score = method._kt_staging_probe_runtime_candidate_score()
+        if score is None:
+            continue
+        expert, score_key = score
+        if _kt_staging_runtime_layer_fairness_enabled():
+            selection_key = (
+                method._kt_staging_probe_runtime_layer_debt(),
+            ) + score_key
+        else:
+            selection_key = score_key
+        scored.append((selection_key, method.kt_config.layer_idx, expert, method))
+
+    if scored:
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        _, _, expert, method = scored[0]
+        method._kt_staging_probe_preselected_expert = expert
+        return method
+
+    _kt_staging_probe_log(
+        "runtime_no_global_candidate",
+        eligible=len(eligible),
+        global_swaps=_KT_STAGING_PROBE_GLOBAL_SWAPS,
+        global_observations=_KT_STAGING_PROBE_GLOBAL_OBSERVATIONS,
+        global_swap_limit=_kt_staging_global_swap_limit(),
+        global_swap_ema_ms=f"{_KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS:.3f}",
+        min_effective_score=f"{_kt_staging_runtime_min_effective_score():.3f}",
+        layer_fairness=_kt_staging_runtime_layer_fairness_enabled(),
+    )
+    return None
+
+
 def run_kt_staging_probe_once(
     device: Optional[torch.device] = None,
     batch_size: int = 0,
@@ -299,11 +596,9 @@ def run_kt_staging_probe_once(
 
     This is called outside CUDA graph replay by the scheduler. It pipelines one
     CPU expert write from the previous step into a scratch H2D copy for this
-    step, then submits the next CPU expert write. It never mutates resident
-    expert weights or routing maps.
+    step, then submits the next CPU expert write. The copy is only prepared here;
+    swap is deferred and re-validated in finish_kt_staging_probe.
     """
-    global _KT_STAGING_PROBE_CURSOR
-
     if not _kt_staging_probe_enabled() or not torch.cuda.is_available():
         return None
     try:
@@ -313,6 +608,14 @@ def run_kt_staging_probe_once(
         return None
 
     wanted_layers = _kt_staging_probe_layers()
+    for method in _KT_STAGING_PROBE_METHODS:
+        if wanted_layers is not None and method.kt_config.layer_idx not in wanted_layers:
+            continue
+        if device is not None and torch.device(device) != method._kt_staging_probe_device:
+            continue
+        method._kt_enable_runtime_graph_stats_replay()
+        method._kt_sync_runtime_graph_counters_if_needed()
+
     eligible = []
     for method in _KT_STAGING_PROBE_METHODS:
         if wanted_layers is not None and method.kt_config.layer_idx not in wanted_layers:
@@ -324,8 +627,9 @@ def run_kt_staging_probe_once(
         _kt_staging_probe_log("no_eligible_method", forward_mode=forward_mode)
         return None
 
-    method = eligible[_KT_STAGING_PROBE_CURSOR % len(eligible)]
-    _KT_STAGING_PROBE_CURSOR += 1
+    method = _select_kt_staging_probe_method(eligible)
+    if method is None:
+        return None
     return method._kt_staging_probe_step(
         batch_size=batch_size,
         forward_mode=forward_mode,
@@ -349,6 +653,8 @@ def finish_kt_staging_probe(probe: Optional[dict]) -> None:
         layer=probe["layer"],
         expert=probe["expert"],
         slot=probe["slot"],
+        batch_size=probe.get("batch_size"),
+        forward_mode=probe.get("forward_mode"),
         mb=f"{probe['bytes'] / 1024**2:.3f}",
         wait_ms=f"{wait_ms:.3f}",
         hidden_ms=f"{hidden_ms:.3f}",
@@ -357,7 +663,11 @@ def finish_kt_staging_probe(probe: Optional[dict]) -> None:
     )
     method = probe.get("method")
     if method is not None:
-        method._kt_staging_probe_maybe_swap(probe)
+        try:
+            method._kt_sync_runtime_graph_counters_if_needed(force=True)
+            method._kt_staging_probe_finalize_prepared_probe(probe)
+        finally:
+            method._kt_staging_probe_complete_inflight(probe)
 
 
 class SharedStagingBuffer:
@@ -2818,11 +3128,35 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
         self._kt_staging_probe_layer: Optional[torch.nn.Module] = None
         self._kt_staging_probe_device: Optional[torch.device] = None
+        self._kt_staging_probe_device_name: str = ""
         self._kt_staging_probe_state: Optional[dict] = None
         self._kt_staging_probe_pending: Optional[dict] = None
         self._kt_staging_probe_cursor: int = 0
         self._kt_staging_probe_warned: bool = False
         self._kt_staging_probe_swaps: int = 0
+        self._kt_staging_probe_epoch_swaps: int = 0
+        self._kt_staging_probe_preselected_expert: Optional[int] = None
+        self._kt_staging_probe_inflight_experts = set()
+        self._kt_staging_probe_prepared_experts: Dict[int, dict] = {}
+        self._kt_staging_probe_planned_evicts: Dict[int, Tuple[int, int]] = {}
+        self._kt_staging_probe_expert_residency_observations: Dict[int, int] = {}
+        self._kt_staging_probe_swap_ema_ms: float = 0.0
+        self._kt_staging_probe_materialize_ema_ms: float = 0.0
+        self._kt_staging_probe_materialize_wait_ema_ms: float = 0.0
+        num_runtime_experts = int(self.gpu_experts_mask.numel())
+        self._kt_residency_controller = KTStagingController(num_runtime_experts)
+        self._kt_runtime_route_scores = [0.0] * num_runtime_experts
+        self._kt_runtime_cpu_scores = [0.0] * num_runtime_experts
+        self._kt_runtime_gpu_scores = [0.0] * num_runtime_experts
+        self._kt_runtime_route_counts = [0] * num_runtime_experts
+        self._kt_runtime_observations: int = 0
+        self._kt_runtime_graph_route_counts_cuda: Optional[torch.Tensor] = None
+        self._kt_runtime_graph_cpu_counts_cuda: Optional[torch.Tensor] = None
+        self._kt_runtime_graph_gpu_counts_cuda: Optional[torch.Tensor] = None
+        self._kt_runtime_graph_observations_cuda: Optional[torch.Tensor] = None
+        self._kt_runtime_graph_replay_enabled_cuda: Optional[torch.Tensor] = None
+        self._kt_runtime_graph_last_sync_t: float = 0.0
+        self._kt_runtime_last_stats_log_observation: int = 0
 
     def create_weights(
         self,
@@ -2895,8 +3229,35 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self._kt_staging_probe_layer = layer
         self._kt_staging_probe_device = target_device
+        try:
+            self._kt_staging_probe_device_name = torch.cuda.get_device_name(
+                target_device
+            )
+        except Exception:
+            self._kt_staging_probe_device_name = str(target_device)
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+        self._kt_staging_probe_expert_residency_observations = {
+            int(logical_id): int(self._kt_runtime_observations)
+            for logical_id, is_gpu in enumerate(self.gpu_experts_mask.tolist())
+            if bool(is_gpu)
+        }
+        if self._is_kt_active_rank:
+            self._kt_runtime_graph_route_counts_cuda = torch.zeros(
+                num_experts, dtype=torch.float32, device=target_device
+            )
+            self._kt_runtime_graph_cpu_counts_cuda = torch.zeros(
+                num_experts, dtype=torch.float32, device=target_device
+            )
+            self._kt_runtime_graph_gpu_counts_cuda = torch.zeros(
+                num_experts, dtype=torch.float32, device=target_device
+            )
+            self._kt_runtime_graph_observations_cuda = torch.zeros(
+                1, dtype=torch.int64, device=target_device
+            )
+            self._kt_runtime_graph_replay_enabled_cuda = torch.zeros(
+                1, dtype=torch.float32, device=target_device
+            )
 
         # Initialize dual-stream for CPU-GPU parallelism (active rank only)
         if self._is_kt_active_rank:
@@ -2968,6 +3329,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             or self._kt_staging_probe_device is None
         ):
             return False
+        if _kt_staging_runtime_device_disabled(self._kt_staging_probe_device_name):
+            if not self._kt_staging_probe_warned:
+                _kt_staging_probe_log(
+                    "disabled_device",
+                    layer=self.kt_config.layer_idx,
+                    device=self._kt_staging_probe_device_name,
+                )
+                self._kt_staging_probe_warned = True
+            return False
         if device is not None and torch.device(device) != self._kt_staging_probe_device:
             return False
         if get_tensor_model_parallel_world_size() != 1:
@@ -3000,6 +3370,744 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             return out or None
         return None
 
+    def _kt_apply_runtime_expert_counts(
+        self,
+        route_counts: Sequence[float],
+        cpu_counts: Sequence[float],
+        gpu_counts: Sequence[float],
+        source: str,
+        observation_count: int = 1,
+    ) -> None:
+        global _KT_STAGING_PROBE_GLOBAL_LAST_RESET_OBSERVATIONS
+        global _KT_STAGING_PROBE_GLOBAL_OBSERVATIONS
+        global _KT_STAGING_PROBE_GLOBAL_SWAPS
+
+        observation_count = max(1, int(observation_count))
+        decay = _kt_staging_runtime_decay() ** observation_count
+        total_count = self._kt_residency_controller.apply_counts(
+            route_counts,
+            cpu_counts,
+            gpu_counts,
+            decay,
+        )
+        self._kt_runtime_route_scores = self._kt_residency_controller.route_scores
+        self._kt_runtime_cpu_scores = self._kt_residency_controller.cpu_scores
+        self._kt_runtime_gpu_scores = self._kt_residency_controller.gpu_scores
+        self._kt_runtime_route_counts = self._kt_residency_controller.route_counts
+        if total_count <= 0.0:
+            return
+
+        self._kt_runtime_observations += observation_count
+        if _kt_staging_policy() == "runtime":
+            self._kt_staging_probe_epoch_swaps = 0
+            _KT_STAGING_PROBE_GLOBAL_OBSERVATIONS += observation_count
+            if _kt_staging_reset_global_swaps_on_observation():
+                _KT_STAGING_PROBE_GLOBAL_SWAPS = 0
+                _KT_STAGING_PROBE_GLOBAL_LAST_RESET_OBSERVATIONS = (
+                    _KT_STAGING_PROBE_GLOBAL_OBSERVATIONS
+                )
+            else:
+                reset_observations = _kt_staging_global_swap_reset_observations()
+                if (
+                    reset_observations > 0
+                    and _KT_STAGING_PROBE_GLOBAL_OBSERVATIONS
+                    - _KT_STAGING_PROBE_GLOBAL_LAST_RESET_OBSERVATIONS
+                    >= reset_observations
+                ):
+                    _KT_STAGING_PROBE_GLOBAL_SWAPS = 0
+                    _KT_STAGING_PROBE_GLOBAL_LAST_RESET_OBSERVATIONS = (
+                        _KT_STAGING_PROBE_GLOBAL_OBSERVATIONS
+                    )
+                    _kt_staging_probe_log(
+                        "global_budget_reset",
+                        layer=self.kt_config.layer_idx,
+                        observations=_KT_STAGING_PROBE_GLOBAL_OBSERVATIONS,
+                        reset_observations=reset_observations,
+                        global_swap_ema_ms=(
+                            f"{_KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS:.3f}"
+                        ),
+                    )
+        log_interval = _kt_runtime_stats_log_interval_observations()
+        if (
+            log_interval > 0
+            and self._kt_runtime_observations
+            - self._kt_runtime_last_stats_log_observation
+            >= log_interval
+        ):
+            self._kt_runtime_last_stats_log_observation = (
+                self._kt_runtime_observations
+            )
+            _kt_staging_probe_log(
+                "runtime_stats",
+                layer=self.kt_config.layer_idx,
+                source=source,
+                observations=self._kt_runtime_observations,
+                new_observations=observation_count,
+                route_total=f"{total_count:.1f}",
+                cpu_total=f"{sum(float(x) for x in cpu_counts):.1f}",
+                gpu_total=f"{sum(float(x) for x in gpu_counts):.1f}",
+            )
+
+    def _kt_record_runtime_expert_use_graph(
+        self, topk_ids: torch.Tensor, num_tokens: int
+    ) -> bool:
+        if not _kt_runtime_graph_stats_enabled():
+            return False
+        if not self._is_kt_active_rank:
+            return False
+        if num_tokens < _kt_staging_runtime_min_tokens():
+            return False
+        if topk_ids.numel() == 0 or not topk_ids.is_cuda:
+            return False
+        if (
+            self._kt_runtime_graph_route_counts_cuda is None
+            or self._kt_runtime_graph_cpu_counts_cuda is None
+            or self._kt_runtime_graph_gpu_counts_cuda is None
+            or self._kt_runtime_graph_observations_cuda is None
+            or self._kt_runtime_graph_replay_enabled_cuda is None
+            or self.gpu_experts_mask_cuda is None
+        ):
+            return False
+
+        num_experts = int(self.gpu_experts_mask.numel())
+        with torch.no_grad():
+            flat = topk_ids.detach().reshape(-1).to(dtype=torch.long)
+            valid = (flat >= 0) & (flat < num_experts)
+            flat = flat.clamp(0, num_experts - 1)
+            enabled_f = self._kt_runtime_graph_replay_enabled_cuda[0].to(
+                dtype=torch.float32
+            )
+            valid_f = valid.to(dtype=torch.float32) * enabled_f
+            gpu_f = self.gpu_experts_mask_cuda[flat].to(dtype=torch.float32) * valid_f
+            cpu_f = valid_f - gpu_f
+            self._kt_runtime_graph_route_counts_cuda.scatter_add_(0, flat, valid_f)
+            self._kt_runtime_graph_cpu_counts_cuda.scatter_add_(0, flat, cpu_f)
+            self._kt_runtime_graph_gpu_counts_cuda.scatter_add_(0, flat, gpu_f)
+            self._kt_runtime_graph_observations_cuda.add_(
+                (valid_f.sum() > 0).to(dtype=torch.int64)
+            )
+        return True
+
+    def _kt_enable_runtime_graph_stats_replay(self) -> None:
+        if self._kt_runtime_graph_replay_enabled_cuda is not None:
+            self._kt_runtime_graph_replay_enabled_cuda.fill_(1.0)
+
+    def _kt_sync_runtime_graph_counters_if_needed(self, force: bool = False) -> None:
+        if not _kt_runtime_graph_stats_enabled():
+            return
+        if not self._is_kt_active_rank:
+            return
+        if (
+            self._kt_runtime_graph_route_counts_cuda is None
+            or self._kt_runtime_graph_cpu_counts_cuda is None
+            or self._kt_runtime_graph_gpu_counts_cuda is None
+            or self._kt_runtime_graph_observations_cuda is None
+        ):
+            return
+        if torch.cuda.is_available():
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except Exception:
+                return
+        now = time.perf_counter()
+        if (
+            not force
+            and now - self._kt_runtime_graph_last_sync_t
+            < _kt_runtime_graph_stats_sync_interval_s()
+        ):
+            return
+        self._kt_runtime_graph_last_sync_t = now
+
+        with torch.no_grad():
+            route_counts_t = self._kt_runtime_graph_route_counts_cuda.detach().to(
+                device="cpu"
+            )
+            cpu_counts_t = self._kt_runtime_graph_cpu_counts_cuda.detach().to(
+                device="cpu"
+            )
+            gpu_counts_t = self._kt_runtime_graph_gpu_counts_cuda.detach().to(
+                device="cpu"
+            )
+            observation_count = int(self._kt_runtime_graph_observations_cuda.item())
+            route_total = float(route_counts_t.sum().item())
+            if route_total <= 0.0 or observation_count <= 0:
+                return
+            self._kt_runtime_graph_route_counts_cuda.zero_()
+            self._kt_runtime_graph_cpu_counts_cuda.zero_()
+            self._kt_runtime_graph_gpu_counts_cuda.zero_()
+            self._kt_runtime_graph_observations_cuda.zero_()
+            self._kt_apply_runtime_expert_counts(
+                route_counts_t.tolist(),
+                cpu_counts_t.tolist(),
+                gpu_counts_t.tolist(),
+                source="cuda_graph",
+                observation_count=observation_count,
+            )
+
+    def _kt_record_runtime_expert_use(
+        self, topk_ids: torch.Tensor, num_tokens: int
+    ) -> None:
+        if not _kt_runtime_expert_stats_enabled():
+            return
+        if not self._is_kt_active_rank:
+            return
+        if num_tokens < _kt_staging_runtime_min_tokens():
+            return
+        wanted_layers = _kt_staging_probe_layers()
+        if (
+            wanted_layers is not None
+            and self.kt_config.layer_idx not in wanted_layers
+        ):
+            return
+        if topk_ids.numel() == 0:
+            return
+        if torch.cuda.is_available():
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    self._kt_record_runtime_expert_use_graph(topk_ids, num_tokens)
+                    return
+            except Exception:
+                return
+
+        num_experts = int(self.gpu_experts_mask.numel())
+        with torch.no_grad():
+            flat = topk_ids.detach().reshape(-1)
+            flat = flat[(flat >= 0) & (flat < num_experts)]
+            if flat.numel() == 0:
+                return
+            flat_cpu = flat.to(device="cpu", dtype=torch.long)
+            counts = torch.bincount(flat_cpu, minlength=num_experts).tolist()
+            gpu_mask = self.gpu_experts_mask.cpu().to(dtype=torch.bool).tolist()
+            cpu_counts = [
+                0.0 if gpu_mask[expert] else float(count)
+                for expert, count in enumerate(counts)
+            ]
+            gpu_counts = [
+                float(count) if gpu_mask[expert] else 0.0
+                for expert, count in enumerate(counts)
+            ]
+            self._kt_apply_runtime_expert_counts(
+                counts,
+                cpu_counts,
+                gpu_counts,
+                source="python",
+            )
+
+    def _kt_runtime_score_fields(self, expert: int, prefix: str) -> Dict[str, str]:
+        if not 0 <= expert < int(self.gpu_experts_mask.numel()):
+            return {}
+        return {
+            f"{prefix}_route_score": f"{self._kt_runtime_route_scores[expert]:.3f}",
+            f"{prefix}_cpu_score": f"{self._kt_runtime_cpu_scores[expert]:.3f}",
+            f"{prefix}_gpu_score": f"{self._kt_runtime_gpu_scores[expert]:.3f}",
+            f"{prefix}_route_count": str(self._kt_runtime_route_counts[expert]),
+            f"{prefix}_cooldown": str(
+                self._kt_residency_controller.cooldown_remaining(
+                    expert,
+                    self._kt_runtime_observations,
+                )
+            ),
+        }
+
+    def _kt_staging_probe_runtime_layer_scores(
+        self,
+    ) -> Tuple[float, float, float, int]:
+        return self._kt_residency_controller.layer_scores(
+            self.gpu_experts_mask.tolist()
+        )
+
+    def _kt_staging_probe_runtime_layer_debt(self) -> float:
+        return self._kt_residency_controller.layer_debt(
+            self.gpu_experts_mask.tolist(),
+            swaps=self._kt_staging_probe_swaps,
+            predicted_total_cost_ms=self._kt_staging_probe_predicted_total_cost_ms(),
+            swap_penalty=_kt_staging_runtime_layer_swap_penalty(),
+        )
+
+    def _kt_staging_probe_initial_swap_cost_ms(self) -> float:
+        initial_cost_ms = _kt_staging_runtime_device_rule_value(
+            "SGLANG_KT_STAGING_RUNTIME_INITIAL_SWAP_COST_MS_BY_DEVICE",
+            self._kt_staging_probe_device_name,
+        )
+        if initial_cost_ms is not None:
+            return max(0.0, initial_cost_ms)
+        raw_initial_cost = os.getenv(
+            "SGLANG_KT_STAGING_RUNTIME_INITIAL_SWAP_COST_MS", "0"
+        )
+        try:
+            return max(0.0, float(raw_initial_cost))
+        except ValueError:
+            logger.warning(
+                "Invalid SGLANG_KT_STAGING_RUNTIME_INITIAL_SWAP_COST_MS=%r; "
+                "using 0",
+                raw_initial_cost,
+            )
+            return 0.0
+
+    def _kt_staging_probe_cost_multiplier(self) -> float:
+        cost_multiplier = _kt_staging_runtime_device_rule_value(
+            "SGLANG_KT_STAGING_RUNTIME_COST_MULTIPLIER_BY_DEVICE",
+            self._kt_staging_probe_device_name,
+        )
+        if cost_multiplier is None:
+            cost_multiplier = 1.0
+        return max(1e-6, cost_multiplier)
+
+    def _kt_staging_probe_min_effective_score(self) -> float:
+        min_effective_score = _kt_staging_runtime_min_effective_score()
+        device_min_effective_score = _kt_staging_runtime_device_rule_value(
+            "SGLANG_KT_STAGING_RUNTIME_MIN_EFFECTIVE_SCORE_BY_DEVICE",
+            self._kt_staging_probe_device_name,
+        )
+        if device_min_effective_score is not None:
+            min_effective_score = max(0.0, device_min_effective_score)
+        return min_effective_score
+
+    def _kt_staging_probe_device_swap_ema_ms(self) -> float:
+        device_key = _kt_staging_probe_device_key(self._kt_staging_probe_device_name)
+        return _KT_STAGING_PROBE_DEVICE_SWAP_EMA_MS.get(device_key, 0.0)
+
+    def _kt_staging_probe_predicted_swap_cost_ms(self) -> float:
+        cost_ms = max(
+            1.0,
+            self._kt_staging_probe_initial_swap_cost_ms(),
+            self._kt_staging_probe_swap_ema_ms,
+            self._kt_staging_probe_device_swap_ema_ms(),
+        )
+        return cost_ms * self._kt_staging_probe_cost_multiplier()
+
+    def _kt_staging_probe_predicted_materialize_cost_ms(self) -> float:
+        materialize_ms = max(
+            self._kt_staging_probe_materialize_ema_ms,
+            _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_EMA_MS,
+        )
+        wait_ms = max(
+            self._kt_staging_probe_materialize_wait_ema_ms,
+            _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_WAIT_EMA_MS,
+        )
+        return wait_ms + materialize_ms * _kt_staging_runtime_materialize_cost_weight()
+
+    def _kt_staging_probe_predicted_total_cost_ms(self) -> float:
+        if not _kt_staging_runtime_cost_aware():
+            return 1.0
+        return max(
+            1.0,
+            self._kt_staging_probe_predicted_swap_cost_ms()
+            + self._kt_staging_probe_predicted_materialize_cost_ms(),
+        )
+
+    def _kt_staging_probe_runtime_commit_stats(
+        self, staged_expert: int, evicted_expert: int, include_materialize: bool
+    ) -> Tuple[float, float, float, float, float]:
+        if include_materialize:
+            cost_ms = self._kt_staging_probe_predicted_total_cost_ms()
+        else:
+            cost_ms = self._kt_staging_probe_predicted_swap_cost_ms()
+        stats = self._kt_residency_controller.commit_stats(
+            staged_expert,
+            evicted_expert,
+            cost_ms,
+            _kt_staging_runtime_commit_margin(),
+        )
+        return (
+            stats.staged_score,
+            stats.evicted_score,
+            stats.net_score,
+            stats.cost_ms,
+            stats.effective_score,
+        )
+
+    def _kt_staging_probe_controller_min_residency_observations(self) -> int:
+        controller = self._kt_residency_controller
+        candidates = (
+            "min_residency_observations",
+            "get_min_residency_observations",
+            "min_residency_window",
+            "get_min_residency_window",
+        )
+        for name in candidates:
+            getter = getattr(controller, name, None)
+            if getter is None:
+                continue
+            try:
+                value = getter() if callable(getter) else getter
+                if callable(value):
+                    value = value()
+                min_obs = int(value)
+            except TypeError:
+                continue
+            except Exception:
+                logger.warning(
+                    "KT staging probe failed reading controller min residency %s", name
+                )
+                continue
+            if min_obs >= 0:
+                return min_obs
+        return 0
+
+    def _kt_staging_probe_residency_stale(self, expert: int, observations: int) -> bool:
+        min_residency = self._kt_staging_probe_controller_min_residency_observations()
+        if min_residency <= 0:
+            return False
+        last = self._kt_staging_probe_expert_residency_observations.get(
+            int(expert), 0
+        )
+        return max(0, observations - last) < min_residency
+
+    def _kt_staging_probe_controller_max_swaps_per_policy_epoch(self) -> int:
+        controller = self._kt_residency_controller
+        candidates = (
+            "max_replacements_per_epoch",
+            "get_max_replacements_per_epoch",
+            "max_swaps_per_policy_epoch",
+            "get_max_swaps_per_policy_epoch",
+            "max_swaps_per_epoch",
+            "policy_epoch_swap_limit",
+            "get_policy_epoch_swap_limit",
+        )
+        for name in candidates:
+            getter = getattr(controller, name, None)
+            if getter is None:
+                continue
+            try:
+                value = getter() if callable(getter) else getter
+                if callable(value):
+                    value = value()
+                limit = int(value)
+            except TypeError:
+                continue
+            except Exception:
+                logger.warning(
+                    "KT staging probe failed reading controller attribute %s", name
+                )
+                continue
+            if limit >= 0:
+                return limit
+        return _kt_staging_swap_limit()
+
+    def _kt_staging_probe_controller_select_prepare_candidate(
+        self, cold_experts: List[int]
+    ) -> Optional[Tuple[int, Tuple[float, ...]]]:
+        controller = self._kt_residency_controller
+
+        min_score = _kt_staging_runtime_min_score()
+        min_effective_score = self._kt_staging_probe_min_effective_score()
+        if not _kt_staging_runtime_cost_aware():
+            min_effective_score = 0.0
+        predicted_total_cost_ms = (
+            self._kt_staging_probe_predicted_total_cost_ms()
+            if _kt_staging_runtime_cost_aware()
+            else 1.0
+        )
+        commit_margin = (
+            _kt_staging_runtime_commit_margin()
+            if _kt_staging_runtime_cost_aware()
+            else 0.0
+        )
+
+        def normalize_planner_result(result) -> Optional[Tuple[int, Tuple[float, ...]]]:
+            if result is None:
+                return None
+
+            if isinstance(result, int):
+                return int(result), ()
+
+            if isinstance(result, dict):
+                expert = result.get("expert")
+                if expert is None:
+                    expert = result.get("staged_expert")
+                if expert is None:
+                    return None
+                try:
+                    expert_i = int(expert)
+                except (TypeError, ValueError):
+                    return None
+                evicted = result.get("evicted_expert")
+                gpu_idx = result.get("gpu_index")
+                if evicted is not None and gpu_idx is not None:
+                    try:
+                        self._kt_staging_probe_planned_evicts[expert_i] = (
+                            int(evicted),
+                            int(gpu_idx),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                score = result.get("score_key", result.get("score"))
+                if score is None:
+                    return expert_i, ()
+                try:
+                    return expert_i, tuple(float(v) for v in score)
+                except (TypeError, ValueError):
+                    return expert_i, ()
+
+            if hasattr(result, "staged_expert") or hasattr(result, "expert"):
+                try:
+                    if hasattr(result, "staged_expert"):
+                        expert = int(getattr(result, "staged_expert"))
+                    else:
+                        expert = int(getattr(result, "expert"))
+                except (AttributeError, TypeError, ValueError):
+                    return None
+                if hasattr(result, "evicted_expert") and hasattr(result, "gpu_index"):
+                    try:
+                        self._kt_staging_probe_planned_evicts[expert] = (
+                            int(getattr(result, "evicted_expert")),
+                            int(getattr(result, "gpu_index")),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                score = getattr(result, "score_key", None)
+                if score is None:
+                    score = (
+                        getattr(result, "effective_score", 0.0),
+                        getattr(result, "net_score", 0.0),
+                        getattr(result, "staged_score", 0.0),
+                        -float(getattr(result, "evicted_score", 0.0)),
+                        getattr(result, "route_score", 0.0),
+                        float(getattr(result, "route_count", 0)),
+                        float(-expert),
+                    )
+                try:
+                    return expert, tuple(float(v) for v in score)
+                except (TypeError, ValueError):
+                    return expert, ()
+
+            if isinstance(result, (list, tuple)):
+                if len(result) == 0:
+                    return None
+                if len(result) >= 2 and isinstance(result[1], (tuple, list)):
+                    try:
+                        expert = int(result[0])
+                        return expert, tuple(float(v) for v in result[1])
+                    except (TypeError, ValueError):
+                        return None
+                try:
+                    return int(result[0]), ()
+                except (TypeError, ValueError):
+                    return None
+
+            return None
+
+        planner = getattr(controller, "next_prepared_replacement", None)
+        if not callable(planner):
+            planner = getattr(controller, "next_replacement", None)
+        if callable(planner):
+            try:
+                result = planner(
+                    gpu_mask=self.gpu_experts_mask.cpu()
+                    .to(dtype=torch.bool)
+                    .tolist(),
+                    gpu_index_to_logical=self.gpu_index_to_logical.cpu().tolist(),
+                    observation_count=self._kt_runtime_observations,
+                    inflight_experts=self._kt_staging_probe_inflight_experts,
+                    min_score=min_score,
+                    min_effective_score=min_effective_score,
+                    predicted_total_cost_ms=predicted_total_cost_ms,
+                    commit_margin=commit_margin,
+                )
+            except Exception:
+                logger.warning(
+                    "KT staging probe controller next_prepared_replacement failed",
+                    exc_info=True,
+                )
+                return None
+            normalized = normalize_planner_result(result)
+            if normalized is not None:
+                return normalized
+
+        selector = getattr(controller, "select_prepare_candidate", None)
+        if not callable(selector):
+            return None
+
+        calls = [
+            dict(
+                cold_experts=cold_experts,
+                inflight_experts=self._kt_staging_probe_inflight_experts,
+                evict_for_expert=self._kt_staging_probe_runtime_evict,
+                min_score=min_score,
+                min_effective_score=min_effective_score,
+                predicted_total_cost_ms=predicted_total_cost_ms,
+                commit_margin=commit_margin,
+                observation_count=self._kt_runtime_observations,
+            ),
+            (
+                cold_experts,
+                self._kt_staging_probe_inflight_experts,
+                self._kt_staging_probe_runtime_evict,
+                min_score,
+                min_effective_score,
+                predicted_total_cost_ms,
+                commit_margin,
+                self._kt_runtime_observations,
+            ),
+            (cold_experts, self._kt_staging_probe_inflight_experts),
+            (cold_experts,),
+        ]
+
+        for call in calls:
+            try:
+                result = (
+                    selector(**call)
+                    if isinstance(call, dict)
+                    else selector(*call)
+                )
+            except TypeError:
+                continue
+            except Exception:
+                logger.warning(
+                    "KT staging probe controller select_prepare_candidate failed",
+                    exc_info=True,
+                )
+                return None
+
+            normalized = normalize_planner_result(result)
+            if normalized is not None:
+                return normalized
+            continue
+        return None
+
+    def _kt_staging_probe_controller_record_prepare(self, staged_expert: int) -> None:
+        controller = self._kt_residency_controller
+        recorder = getattr(controller, "record_prepare", None)
+        if not callable(recorder):
+            return
+        planned = self._kt_staging_probe_planned_evicts.get(int(staged_expert))
+        calls = []
+        if planned is not None:
+            calls.append((staged_expert, int(planned[0])))
+        calls.extend(
+            (
+                (staged_expert, self._kt_runtime_observations),
+                (staged_expert,),
+            )
+        )
+        for args in calls:
+            try:
+                recorder(*args)
+                return
+            except TypeError:
+                continue
+            except Exception:
+                logger.warning(
+                    "KT staging probe controller record_prepare failed",
+                    exc_info=True,
+                )
+                return
+
+    def _kt_staging_probe_controller_should_commit_prepared(
+        self, staged_expert: int, evicted_expert: int
+    ) -> Optional[bool]:
+        controller = self._kt_residency_controller
+        checker = getattr(controller, "should_commit_prepared", None)
+        if not callable(checker):
+            return None
+        calls = (
+            (staged_expert, evicted_expert, self._kt_runtime_observations),
+            (staged_expert, evicted_expert),
+            (staged_expert,),
+        )
+        for args in calls:
+            try:
+                decision = checker(*args)
+                if decision is not None:
+                    return bool(decision)
+            except TypeError:
+                continue
+            except Exception:
+                logger.warning(
+                    "KT staging probe controller should_commit_prepared failed",
+                    exc_info=True,
+                )
+                return None
+        return None
+
+    def _kt_runtime_layer_score_fields(self, prefix: str) -> Dict[str, str]:
+        route_score, cpu_score, gpu_score, route_count = (
+            self._kt_staging_probe_runtime_layer_scores()
+        )
+        return {
+            f"{prefix}_route_score": f"{route_score:.3f}",
+            f"{prefix}_cpu_score": f"{cpu_score:.3f}",
+            f"{prefix}_gpu_score": f"{gpu_score:.3f}",
+            f"{prefix}_route_count": str(route_count),
+            f"{prefix}_swap_debt": (
+                f"{self._kt_staging_probe_runtime_layer_debt():.3f}"
+            ),
+            f"{prefix}_swaps": str(self._kt_staging_probe_swaps),
+            f"{prefix}_predicted_cost_ms": (
+                f"{self._kt_staging_probe_predicted_total_cost_ms():.3f}"
+            ),
+        }
+
+    def _kt_staging_probe_at_epoch_limit(self) -> bool:
+        limit = self._kt_staging_probe_controller_max_swaps_per_policy_epoch()
+        return (
+            _kt_staging_swap_enabled()
+            and limit > 0
+            and self._kt_staging_probe_epoch_swaps >= limit
+        )
+
+    def _kt_staging_probe_runtime_candidate_score(
+        self,
+    ) -> Optional[Tuple[int, Tuple[float, ...]]]:
+        if (
+            self._kt_staging_probe_at_epoch_limit()
+            or _kt_staging_probe_global_at_limit()
+        ):
+            return None
+        min_score = _kt_staging_runtime_min_score()
+        min_effective_score = self._kt_staging_probe_min_effective_score()
+        cold = torch.where(~self.gpu_experts_mask.cpu())[0]
+        if not _kt_staging_runtime_cost_aware():
+            min_effective_score = 0.0
+        cold_experts = cold.tolist()
+        if not cold_experts:
+            return None
+        planner_pick = self._kt_staging_probe_controller_select_prepare_candidate(
+            cold_experts
+        )
+        if planner_pick is not None:
+            return planner_pick
+        return self._kt_residency_controller.choose_candidate(
+            cold_experts,
+            self._kt_staging_probe_inflight_experts,
+            self._kt_staging_probe_runtime_evict,
+            min_score=min_score,
+            min_effective_score=min_effective_score,
+            predicted_total_cost_ms=(
+                self._kt_staging_probe_predicted_total_cost_ms()
+                if _kt_staging_runtime_cost_aware()
+                else 1.0
+            ),
+            commit_margin=(
+                _kt_staging_runtime_commit_margin()
+                if _kt_staging_runtime_cost_aware()
+                else 0.0
+            ),
+            observation_count=self._kt_runtime_observations,
+        )
+
+    def _kt_staging_probe_runtime_candidate(self) -> Optional[int]:
+        min_score = _kt_staging_runtime_min_score()
+        min_effective_score = self._kt_staging_probe_min_effective_score()
+        best = self._kt_staging_probe_runtime_candidate_score()
+        if best is None:
+            _kt_staging_probe_log(
+                "runtime_no_candidate",
+                layer=self.kt_config.layer_idx,
+                observations=self._kt_runtime_observations,
+                device=self._kt_staging_probe_device_name,
+                min_score=f"{min_score:.3f}",
+                min_effective_score=f"{min_effective_score:.3f}",
+                global_swaps=_KT_STAGING_PROBE_GLOBAL_SWAPS,
+                global_observations=_KT_STAGING_PROBE_GLOBAL_OBSERVATIONS,
+                global_swap_limit=_kt_staging_global_swap_limit(),
+                global_swap_ema_ms=f"{_KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS:.3f}",
+            )
+            return None
+        return int(best[0])
+
     def _kt_staging_probe_next_expert(self) -> Optional[int]:
         configured = self._kt_staging_probe_configured_experts()
         if configured is not None:
@@ -3008,15 +4116,68 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 for expert in configured
                 if 0 <= expert < int(getattr(self, "global_num_experts", 0))
             ]
-        else:
-            with torch.no_grad():
-                cold = torch.where(~self.gpu_experts_mask.cpu())[0]
-                candidates = [int(x) for x in cold.tolist()]
+            if not candidates:
+                return None
+            expert = candidates[self._kt_staging_probe_cursor % len(candidates)]
+            self._kt_staging_probe_cursor += 1
+            return int(expert)
+
+        if _kt_staging_policy() == "runtime":
+            preselected = self._kt_staging_probe_preselected_expert
+            self._kt_staging_probe_preselected_expert = None
+            if preselected is not None:
+                if (
+                    0 <= preselected < int(self.gpu_experts_mask.numel())
+                    and not bool(self.gpu_experts_mask[preselected].item())
+                    and preselected not in self._kt_staging_probe_inflight_experts
+                ):
+                    return int(preselected)
+            return self._kt_staging_probe_runtime_candidate()
+
+        with torch.no_grad():
+            cold = torch.where(~self.gpu_experts_mask.cpu())[0]
+            candidates = [int(x) for x in cold.tolist()]
         if not candidates:
             return None
         expert = candidates[self._kt_staging_probe_cursor % len(candidates)]
         self._kt_staging_probe_cursor += 1
         return int(expert)
+
+    def _kt_staging_probe_runtime_evict(
+        self, staged_expert: int
+    ) -> Optional[Tuple[int, int]]:
+        candidates = []
+        evict = self._kt_residency_controller.choose_evict(
+            staged_expert,
+            self.gpu_index_to_logical.tolist(),
+            observation_count=self._kt_runtime_observations,
+        )
+        if evict is not None:
+            return evict
+        for gpu_idx, logical in enumerate(self.gpu_index_to_logical.tolist()):
+            try:
+                logical_id = int(logical)
+            except (TypeError, ValueError):
+                continue
+            if (
+                logical_id < 0
+                or logical_id >= len(self._kt_runtime_route_scores)
+                or logical_id == staged_expert
+            ):
+                continue
+            candidates.append(
+                (
+                    self._kt_runtime_route_scores[logical_id],
+                    self._kt_runtime_gpu_scores[logical_id],
+                    logical_id,
+                    int(gpu_idx),
+                )
+            )
+        if not candidates:
+            return None
+        candidates.sort()
+        _, _, logical_id, gpu_idx = candidates[0]
+        return int(logical_id), int(gpu_idx)
 
     def _kt_staging_probe_ensure_state(self) -> Optional[dict]:
         if self._kt_staging_probe_state is not None:
@@ -3111,15 +4272,89 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             "submit_t": time.perf_counter(),
             "bytes": sum(per_expert_nbytes.values()),
         }
+        self._kt_staging_probe_inflight_experts.add(int(expert))
+        score_fields = self._kt_runtime_score_fields(int(expert), "expert")
+        score_fields.update(self._kt_runtime_layer_score_fields("layer"))
         _kt_staging_probe_log(
             "cpu_submit",
             layer=self.kt_config.layer_idx,
             expert=expert,
             slot=slot,
+            policy=_kt_staging_policy(),
+            device=self._kt_staging_probe_device_name,
+            observations=self._kt_runtime_observations,
+            swap_ema_ms=f"{self._kt_staging_probe_swap_ema_ms:.3f}",
+            global_swap_ema_ms=f"{_KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS:.3f}",
             mb=f"{sum(per_expert_nbytes.values()) / 1024**2:.3f}",
             elapsed_ms=f"{(time.perf_counter() - t_submit) * 1000.0:.3f}",
+            **score_fields,
         )
         return True
+
+    def _kt_staging_probe_complete_inflight(self, probe: dict) -> None:
+        self._kt_staging_probe_inflight_experts.discard(int(probe["expert"]))
+
+    def _kt_staging_probe_record_swap_cost(self, elapsed_ms: float) -> None:
+        global _KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS, _KT_STAGING_PROBE_GLOBAL_SWAPS
+
+        if self._kt_staging_probe_swap_ema_ms <= 0.0:
+            self._kt_staging_probe_swap_ema_ms = elapsed_ms
+        else:
+            self._kt_staging_probe_swap_ema_ms = (
+                self._kt_staging_probe_swap_ema_ms * 0.8 + elapsed_ms * 0.2
+            )
+        if _KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS <= 0.0:
+            _KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS = elapsed_ms
+        else:
+            _KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS = (
+                _KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS * 0.8 + elapsed_ms * 0.2
+            )
+        device_key = _kt_staging_probe_device_key(self._kt_staging_probe_device_name)
+        device_ema_ms = _KT_STAGING_PROBE_DEVICE_SWAP_EMA_MS.get(device_key, 0.0)
+        if device_ema_ms <= 0.0:
+            _KT_STAGING_PROBE_DEVICE_SWAP_EMA_MS[device_key] = elapsed_ms
+        else:
+            _KT_STAGING_PROBE_DEVICE_SWAP_EMA_MS[device_key] = (
+                device_ema_ms * 0.8 + elapsed_ms * 0.2
+            )
+        _KT_STAGING_PROBE_GLOBAL_SWAPS += 1
+
+    def _kt_staging_probe_record_materialize_cost(
+        self, hidden_ms: float, wait_ms: float
+    ) -> None:
+        global _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_EMA_MS
+        global _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_WAIT_EMA_MS
+
+        hidden_ms = max(0.0, hidden_ms)
+        wait_ms = max(0.0, wait_ms)
+        if self._kt_staging_probe_materialize_ema_ms <= 0.0:
+            self._kt_staging_probe_materialize_ema_ms = hidden_ms
+        else:
+            self._kt_staging_probe_materialize_ema_ms = (
+                self._kt_staging_probe_materialize_ema_ms * 0.8
+                + hidden_ms * 0.2
+            )
+        if self._kt_staging_probe_materialize_wait_ema_ms <= 0.0:
+            self._kt_staging_probe_materialize_wait_ema_ms = wait_ms
+        else:
+            self._kt_staging_probe_materialize_wait_ema_ms = (
+                self._kt_staging_probe_materialize_wait_ema_ms * 0.8
+                + wait_ms * 0.2
+            )
+        if _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_EMA_MS <= 0.0:
+            _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_EMA_MS = hidden_ms
+        else:
+            _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_EMA_MS = (
+                _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_EMA_MS * 0.8
+                + hidden_ms * 0.2
+            )
+        if _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_WAIT_EMA_MS <= 0.0:
+            _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_WAIT_EMA_MS = wait_ms
+        else:
+            _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_WAIT_EMA_MS = (
+                _KT_STAGING_PROBE_GLOBAL_MATERIALIZE_WAIT_EMA_MS * 0.8
+                + wait_ms * 0.2
+            )
 
     def _kt_staging_probe_step(
         self, batch_size: int = 0, forward_mode: str = ""
@@ -3142,10 +4377,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     slot=pending["slot"],
                     error=str(err).splitlines()[0],
                 )
+                self._kt_staging_probe_inflight_experts.discard(int(pending["expert"]))
                 self._kt_staging_probe_pending = None
                 return None
             cpu_wait_ms = (time.perf_counter() - t_sync) * 1000.0
             cpu_total_ms = (time.perf_counter() - pending["submit_t"]) * 1000.0
+            cpu_hidden_ms = max(0.0, cpu_total_ms - cpu_wait_ms)
+            self._kt_staging_probe_record_materialize_cost(
+                hidden_ms=cpu_hidden_ms,
+                wait_ms=cpu_wait_ms,
+            )
             slot = pending["slot"]
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
@@ -3169,6 +4410,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "expert": pending["expert"],
                 "slot": slot,
                 "bytes": pending["bytes"],
+                "batch_size": batch_size,
+                "forward_mode": forward_mode,
                 "method": self,
             }
             _kt_staging_probe_log(
@@ -3180,10 +4423,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 forward_mode=forward_mode,
                 mb=f"{pending['bytes'] / 1024**2:.3f}",
                 cpu_wait_ms=f"{cpu_wait_ms:.3f}",
+                cpu_hidden_ms=f"{cpu_hidden_ms:.3f}",
                 cpu_total_ms=f"{cpu_total_ms:.3f}",
+                materialize_ema_ms=(
+                    f"{self._kt_staging_probe_materialize_ema_ms:.3f}"
+                ),
+                materialize_wait_ema_ms=(
+                    f"{self._kt_staging_probe_materialize_wait_ema_ms:.3f}"
+                ),
                 pinned=state["pinned"],
             )
             self._kt_staging_probe_pending = None
+
+        if self._kt_staging_probe_at_epoch_limit():
+            return probe
+        if _kt_staging_probe_global_at_limit():
+            return probe
 
         next_expert = self._kt_staging_probe_next_expert()
         if next_expert is not None:
@@ -3194,6 +4449,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_staging_probe_log(
                 "no_candidate",
                 layer=self.kt_config.layer_idx,
+                policy=_kt_staging_policy(),
+                observations=self._kt_runtime_observations,
             )
 
         return probe
@@ -3231,6 +4488,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         return int(logical_id), gpu_idx
             return None
 
+        planned = self._kt_staging_probe_planned_evicts.get(int(staged_expert))
+        if planned is not None:
+            evicted_expert, gpu_idx = int(planned[0]), int(planned[1])
+            valid_expert = 0 <= evicted_expert < int(self.gpu_experts_mask.numel())
+            valid_slot = 0 <= gpu_idx < int(self.gpu_index_to_logical.numel())
+            if valid_expert and valid_slot:
+                current_logical = int(self.gpu_index_to_logical[gpu_idx].item())
+                if (
+                    current_logical == evicted_expert
+                    and bool(self.gpu_experts_mask[evicted_expert].item())
+                    and not bool(self.gpu_experts_mask[staged_expert].item())
+                ):
+                    return evicted_expert, gpu_idx
+            self._kt_staging_probe_planned_evicts.pop(int(staged_expert), None)
+
+        if _kt_staging_policy() == "runtime":
+            return self._kt_staging_probe_runtime_evict(staged_expert)
+
         num_slots = int(self.num_gpu_experts)
         if num_slots <= 0:
             return None
@@ -3242,48 +4517,231 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 return logical_id, gpu_idx
         return None
 
-    def _kt_staging_probe_maybe_swap(self, probe: dict) -> None:
+    def _kt_staging_probe_log_prepared_state(
+        self, state: str, expert: int, **fields
+    ) -> None:
+        if not _kt_staging_probe_enabled():
+            return
+        _kt_staging_probe_log(
+            "staging_state",
+            layer=self.kt_config.layer_idx,
+            expert=expert,
+            state=state,
+            policy=_kt_staging_policy(),
+            observations=self._kt_runtime_observations,
+            **fields,
+        )
+
+    def _kt_staging_probe_finalize_prepared_probe(self, probe: dict) -> None:
+        staged_expert = int(probe["expert"])
+        slot = int(probe["slot"])
+        planned = self._kt_staging_probe_planned_evicts.get(staged_expert)
+        self._kt_staging_probe_prepared_experts[staged_expert] = {
+            "slot": slot,
+            "state": "prepared",
+            "prepared_t": time.perf_counter(),
+            "batch_size": probe.get("batch_size", 0),
+            "forward_mode": probe.get("forward_mode", ""),
+            "observations": self._kt_runtime_observations,
+            "planned_evict": int(planned[0]) if planned is not None else None,
+            "planned_gpu_idx": int(planned[1]) if planned is not None else None,
+        }
+        self._kt_staging_probe_log_prepared_state(
+            "prepared",
+            expert=staged_expert,
+            slot=slot,
+            planned_evict=int(planned[0]) if planned is not None else None,
+            planned_gpu_idx=int(planned[1]) if planned is not None else None,
+            batch_size=probe.get("batch_size", 0),
+            forward_mode=probe.get("forward_mode", ""),
+        )
+
+        self._kt_staging_probe_controller_record_prepare(staged_expert)
+        self._kt_staging_probe_commit_prepared(probe)
+        if staged_expert not in self._kt_staging_probe_prepared_experts:
+            self._kt_staging_probe_planned_evicts.pop(staged_expert, None)
+
+    def _kt_staging_probe_commit_prepared(self, probe: dict) -> None:
+        staged_expert = int(probe["expert"])
+        slot = int(probe["slot"])
+        expert_state = self._kt_staging_probe_prepared_experts.get(staged_expert, None)
+
         if not _kt_staging_swap_enabled():
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "discard",
+                expert=staged_expert,
+                slot=slot,
+                reason="swap_disabled",
+            )
             return
-        limit = _kt_staging_swap_limit()
-        if limit > 0 and self._kt_staging_probe_swaps >= limit:
+
+        limit = self._kt_staging_probe_controller_max_swaps_per_policy_epoch()
+        if limit > 0 and self._kt_staging_probe_epoch_swaps >= limit:
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "discard",
+                expert=staged_expert,
+                slot=slot,
+                reason="policy_epoch_limit",
+                epoch_swaps=self._kt_staging_probe_epoch_swaps,
+                epoch_swap_limit=limit,
+            )
             return
+
+        if _kt_staging_probe_global_at_limit():
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "discard",
+                expert=staged_expert,
+                slot=slot,
+                reason="global_limit",
+                global_swaps=_KT_STAGING_PROBE_GLOBAL_SWAPS,
+                global_swap_limit=_kt_staging_global_swap_limit(),
+            )
+            return
+
         try:
             if torch.cuda.is_current_stream_capturing():
-                _kt_staging_probe_log(
-                    "swap_skip_capture",
-                    layer=self.kt_config.layer_idx,
-                    expert=probe["expert"],
+                self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+                self._kt_staging_probe_log_prepared_state(
+                    "discard",
+                    expert=staged_expert,
+                    slot=slot,
+                    reason="capture",
                 )
                 return
         except Exception:
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
             return
 
         state = self._kt_staging_probe_state
         layer = self._kt_staging_probe_layer
         names = self._kt_staging_probe_weight_names()
         if state is None or layer is None or names is None:
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "discard",
+                expert=staged_expert,
+                slot=slot,
+                reason="missing_state",
+            )
             return
 
-        staged_expert = int(probe["expert"])
+        # If planner marked expert as prepared for a prior policy snapshot, verify
+        # it is still desirable before doing the expensive swap.
         if bool(self.gpu_experts_mask[staged_expert].item()):
-            _kt_staging_probe_log(
-                "swap_skip_resident",
-                layer=self.kt_config.layer_idx,
+            self._kt_residency_controller.record_resident_skip(staged_expert)
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "stale_prepared",
                 expert=staged_expert,
+                slot=slot,
+                reason="already_resident",
             )
             return
 
         evict = self._kt_staging_probe_choose_evict(staged_expert, state)
         if evict is None:
-            _kt_staging_probe_log(
-                "swap_skip_no_evict",
-                layer=self.kt_config.layer_idx,
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "discard",
                 expert=staged_expert,
+                slot=slot,
+                reason="no_evict",
             )
             return
 
         evicted_expert, gpu_idx = evict
+        if self._kt_staging_probe_residency_stale(
+            evicted_expert, self._kt_runtime_observations
+        ):
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "stale_prepared",
+                expert=staged_expert,
+                evicted=evicted_expert,
+                gpu_idx=gpu_idx,
+                slot=slot,
+                reason="min_residency",
+            )
+            return
+
+        staged_score_fields = self._kt_runtime_score_fields(staged_expert, "expert")
+        evicted_score_fields = self._kt_runtime_score_fields(
+            evicted_expert, "evicted"
+        )
+        (
+            staged_cpu_score,
+            evicted_gpu_score,
+            net_score,
+            predicted_swap_cost_ms,
+            effective_score,
+        ) = self._kt_staging_probe_runtime_commit_stats(
+            staged_expert,
+            evicted_expert,
+            include_materialize=True,
+        )
+
+        planned_decision = self._kt_staging_probe_controller_should_commit_prepared(
+            staged_expert, evicted_expert
+        )
+        if planned_decision is False:
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "stale_prepared",
+                expert=staged_expert,
+                evicted=evicted_expert,
+                gpu_idx=gpu_idx,
+                slot=slot,
+                reason="controller_reject",
+                staged_cpu_score=f"{staged_cpu_score:.3f}",
+                evicted_gpu_score=f"{evicted_gpu_score:.3f}",
+                net_score=f"{net_score:.3f}",
+                predicted_swap_cost_ms=f"{predicted_swap_cost_ms:.3f}",
+                effective_score=f"{effective_score:.3f}",
+                min_effective_score=(
+                    f"{self._kt_staging_probe_min_effective_score():.3f}"
+                ),
+                **staged_score_fields,
+                **evicted_score_fields,
+            )
+            return
+
+        if (
+            _kt_staging_policy() == "runtime"
+            and _kt_staging_runtime_cost_aware()
+            and (
+                net_score <= 0.0
+                or effective_score < self._kt_staging_probe_min_effective_score()
+            )
+        ):
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+            self._kt_staging_probe_log_prepared_state(
+                "stale_prepared" if planned_decision is None else "discard",
+                expert=staged_expert,
+                evicted=evicted_expert,
+                gpu_idx=gpu_idx,
+                slot=slot,
+                reason="cost_check",
+                staged_cpu_score=f"{staged_cpu_score:.3f}",
+                evicted_gpu_score=f"{evicted_gpu_score:.3f}",
+                net_score=f"{net_score:.3f}",
+                predicted_swap_cost_ms=f"{predicted_swap_cost_ms:.3f}",
+                effective_score=f"{effective_score:.3f}",
+                min_effective_score=(
+                    f"{self._kt_staging_probe_min_effective_score():.3f}"
+                ),
+                materialize_ema_ms=f"{self._kt_staging_probe_materialize_ema_ms:.3f}",
+                materialize_wait_ema_ms=(
+                    f"{self._kt_staging_probe_materialize_wait_ema_ms:.3f}"
+                ),
+                device_swap_ema_ms=f"{self._kt_staging_probe_device_swap_ema_ms():.3f}",
+                **staged_score_fields,
+                **evicted_score_fields,
+            )
+            return
+
         t_swap = time.perf_counter()
         current_stream = torch.cuda.current_stream(self._kt_staging_probe_device)
         start_event = torch.cuda.Event(enable_timing=True)
@@ -3292,7 +4750,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         for name in names:
             dst_weight = getattr(layer, name)
             dst_weight[gpu_idx].copy_(
-                state["gpu_scratch"][name][probe["slot"]],
+                state["gpu_scratch"][name][slot],
                 non_blocking=True,
             )
         end_event.record(current_stream)
@@ -3308,28 +4766,85 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.logical_to_gpu_index[staged_expert] = int(gpu_idx)
         self.gpu_index_to_logical[gpu_idx] = int(staged_expert)
         self.kt_config.gpu_experts_mask = self.gpu_experts_mask
-        self.gpu_experts_mask_cuda.copy_(
-            self.gpu_experts_mask.to(device=self._kt_staging_probe_device)
-        )
+        self.gpu_experts_mask_cuda.copy_(self.gpu_experts_mask.to(device=self._kt_staging_probe_device))
         self.logical_to_gpu_index_cuda.copy_(
             self.logical_to_gpu_index.to(device=self._kt_staging_probe_device)
         )
         if self._is_kt_active_rank:
             update_kt_wrapper_masks(self.wrapper, self.gpu_experts_mask)
 
+        self._kt_residency_controller.record_commit(
+            staged_expert,
+            evicted_expert,
+            self._kt_runtime_observations,
+        )
+        self._kt_staging_probe_expert_residency_observations[staged_expert] = (
+            self._kt_runtime_observations
+        )
+        self._kt_staging_probe_expert_residency_observations[evicted_expert] = (
+            self._kt_runtime_observations
+        )
+        if expert_state is not None and expert_state.get("state") == "prepared":
+            self._kt_staging_probe_prepared_experts.pop(staged_expert, None)
+
         self._kt_staging_probe_swaps += 1
+        self._kt_staging_probe_epoch_swaps += 1
+        elapsed_ms = (time.perf_counter() - t_swap) * 1000.0
+        self._kt_staging_probe_record_swap_cost(elapsed_ms)
+        self._kt_staging_probe_log_prepared_state(
+            "commit",
+            expert=staged_expert,
+            evicted=evicted_expert,
+            gpu_idx=gpu_idx,
+            slot=slot,
+            swaps=self._kt_staging_probe_swaps,
+            epoch_swaps=self._kt_staging_probe_epoch_swaps,
+            global_swaps=_KT_STAGING_PROBE_GLOBAL_SWAPS,
+            global_observations=_KT_STAGING_PROBE_GLOBAL_OBSERVATIONS,
+            global_swap_limit=_kt_staging_global_swap_limit(),
+            swap_ema_ms=f"{self._kt_staging_probe_swap_ema_ms:.3f}",
+            global_swap_ema_ms=f"{_KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS:.3f}",
+            device_swap_ema_ms=f"{self._kt_staging_probe_device_swap_ema_ms():.3f}",
+            net_score=f"{net_score:.3f}",
+            predicted_swap_cost_ms=f"{predicted_swap_cost_ms:.3f}",
+            effective_score=f"{effective_score:.3f}",
+            weight_copy_ms=f"{weight_copy_ms:.3f}" if weight_copy_ms is not None else None,
+            elapsed_ms=f"{elapsed_ms:.3f}",
+            **staged_score_fields,
+            **evicted_score_fields,
+        )
+
+        # Use the same structured log entry as existing swap telemetry so
+        # dashboards can keep parsing on older tooling.
         _kt_staging_probe_log(
             "swap",
             layer=self.kt_config.layer_idx,
             expert=staged_expert,
             evicted=evicted_expert,
             gpu_idx=gpu_idx,
+            policy=_kt_staging_policy(),
+            observations=self._kt_runtime_observations,
             swaps=self._kt_staging_probe_swaps,
+            epoch_swaps=self._kt_staging_probe_epoch_swaps,
+            global_swaps=_KT_STAGING_PROBE_GLOBAL_SWAPS,
+            global_observations=_KT_STAGING_PROBE_GLOBAL_OBSERVATIONS,
+            global_swap_limit=_kt_staging_global_swap_limit(),
+            swap_ema_ms=f"{self._kt_staging_probe_swap_ema_ms:.3f}",
+            global_swap_ema_ms=f"{_KT_STAGING_PROBE_GLOBAL_SWAP_EMA_MS:.3f}",
+            device_swap_ema_ms=f"{self._kt_staging_probe_device_swap_ema_ms():.3f}",
+            net_score=f"{net_score:.3f}",
+            predicted_swap_cost_ms=f"{predicted_swap_cost_ms:.3f}",
+            effective_score=f"{effective_score:.3f}",
             weight_copy_ms=(
                 f"{weight_copy_ms:.3f}" if weight_copy_ms is not None else None
             ),
-            elapsed_ms=f"{(time.perf_counter() - t_swap) * 1000.0:.3f}",
+            elapsed_ms=f"{elapsed_ms:.3f}",
+            **staged_score_fields,
+            **evicted_score_fields,
         )
+
+    def _kt_staging_probe_maybe_swap(self, probe: dict) -> None:
+        self._kt_staging_probe_finalize_prepared_probe(probe)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -3611,6 +5126,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
             else:
                 try:
+                    self._kt_record_runtime_expert_use(
+                        topk_output.topk_ids, num_tokens
+                    )
                     ctx = self._build_full_context(layer)
 
                     t_compute = time.perf_counter()
@@ -3727,6 +5245,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
         topk_ids = topk_output.topk_ids
+        self._kt_record_runtime_expert_use(topk_ids, num_tokens)
         _kt_log_hitmiss(
             self,
             topk_ids,

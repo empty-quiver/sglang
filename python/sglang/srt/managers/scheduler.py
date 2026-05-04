@@ -15,6 +15,7 @@
 
 import faulthandler
 import logging
+import json
 import os
 import signal
 import sys
@@ -425,32 +426,189 @@ def _finish_dflash_h2d_overlap_probe(scheduler, probe: Optional[dict]) -> None:
     )
 
 
-def _maybe_start_kt_staging_probe(
-    scheduler, batch: Optional[ScheduleBatch]
-) -> Optional[dict]:
-    if (
-        batch is None
-        or not getattr(scheduler, "enable_overlap", False)
-        or getattr(scheduler, "pp_size", 1) <= 1
-        or getattr(scheduler, "spec_algorithm", None) is None
-        or not scheduler.spec_algorithm.is_dflash()
-        or not torch.cuda.is_available()
-        or not batch.forward_mode.is_decode()
-    ):
-        return None
-    try:
-        from sglang.srt.layers.moe.kt_ep_wrapper import run_kt_staging_probe_once
+_KT_STAGING_WINDOW_BUDGET_ENVS = {
+    "forward": "SGLANG_KT_STAGING_FORWARD_BUDGET",
+    "result": "SGLANG_KT_STAGING_RESULT_BUDGET",
+    "idle": "SGLANG_KT_STAGING_IDLE_BUDGET",
+    "prefill_decode": "SGLANG_KT_STAGING_PREFILL_DECODE_BUDGET",
+}
 
-        return run_kt_staging_probe_once(
-            device=torch.device("cuda", torch.cuda.current_device()),
-            batch_size=batch.batch_size(),
-            forward_mode=batch.forward_mode.name,
+_KT_STAGING_WINDOW_DEFAULT_BUDGETS = {
+    "forward": 1,
+    "result": 0,
+    "idle": 0,
+    "prefill_decode": 0,
+}
+
+_KT_STAGING_WINDOW_LABEL_REQUEST_PREVIEW = 4
+
+
+def _kt_staging_env_enabled(name: str) -> bool:
+    return os.getenv(name) in ("1", "true", "TRUE")
+
+
+def _kt_staging_planner_epoch_stride() -> int:
+    return max(1, get_int_env_var("SGLANG_KT_STAGING_PLANNER_EPOCH_STRIDE", 1))
+
+
+def _kt_staging_planner_epoch(scheduler) -> int:
+    return max(
+        0, int(getattr(scheduler, "forward_ct", 0)) // _kt_staging_planner_epoch_stride()
+    )
+
+
+def _kt_staging_decode_state_batch_size(
+    scheduler, batch: Optional[ScheduleBatch], phase: str
+) -> int:
+    if phase == "idle":
+        running_batch = getattr(scheduler, "running_batch", None)
+        running_forward_mode = getattr(running_batch, "forward_mode", None)
+        if (
+            running_batch is None
+            or running_forward_mode is None
+            or not running_forward_mode.is_decode()
+        ):
+            return 0
+        return running_batch.batch_size()
+
+    forward_mode = getattr(batch, "forward_mode", None)
+    if batch is None or forward_mode is None or not forward_mode.is_decode():
+        return 0
+    return batch.batch_size()
+
+
+def _kt_staging_window_budget(
+    scheduler, batch: Optional[ScheduleBatch], phase: str
+) -> int:
+    env_name = _KT_STAGING_WINDOW_BUDGET_ENVS.get(phase)
+    default = _KT_STAGING_WINDOW_DEFAULT_BUDGETS.get(phase, 0)
+    if (
+        phase == "result"
+        and env_name is not None
+        and os.getenv(env_name) is None
+        and _kt_staging_env_enabled("SGLANG_KT_STAGING_RESULT_WINDOW")
+    ):
+        default = 1
+    raw = os.getenv(env_name) if env_name is not None else None
+    if raw is None:
+        budget = default
+    else:
+        try:
+            budget = max(0, int(raw))
+        except ValueError:
+            logger.warning("Invalid %s=%r; using %d", env_name, raw, default)
+            budget = default
+
+    budget = max(0, budget)
+    decode_state_batch = _kt_staging_decode_state_batch_size(scheduler, batch, phase)
+    if decode_state_batch <= 0:
+        return 0
+    return min(budget, decode_state_batch)
+
+
+def _kt_staging_runtime_window_label(context: Dict[str, Any]) -> str:
+    return json.dumps(context, separators=(",", ":"), sort_keys=True)
+
+
+def _kt_staging_request_id_preview(
+    batch: Optional[ScheduleBatch], scheduler, phase: str
+) -> List[str]:
+    if phase == "idle":
+        batch = getattr(scheduler, "running_batch", None)
+    if batch is None:
+        return []
+    return [str(req.rid) for req in batch.reqs[:_KT_STAGING_WINDOW_LABEL_REQUEST_PREVIEW]]
+
+
+def _kt_staging_runtime_window_context(
+    scheduler,
+    batch: Optional[ScheduleBatch],
+    phase: str,
+    stage: str,
+    index: int,
+) -> Dict[str, Any]:
+    batch_size = batch.batch_size() if batch is not None else 0
+    decode_state = _kt_staging_decode_state_batch_size(scheduler, batch, phase)
+    mode = "IDLE"
+    if batch is not None:
+        forward_mode = getattr(batch, "forward_mode", None)
+        mode = forward_mode.name if forward_mode is not None else "UNKNOWN"
+    return {
+        "planner_epoch": _kt_staging_planner_epoch(scheduler),
+        "planner_stride": _kt_staging_planner_epoch_stride(),
+        "pp": getattr(scheduler, "pp_rank", None),
+        "phase": phase,
+        "stage": stage,
+        "slot": index,
+        "mode": mode,
+        "batch_size": batch_size,
+        "decode_state": decode_state,
+        "request_ids": _kt_staging_request_id_preview(batch, scheduler, phase),
+    }
+
+
+def _kt_staging_window_batch_supported(
+    batch: Optional[ScheduleBatch], phase: str
+) -> bool:
+    if phase == "idle":
+        forward_mode = getattr(batch, "forward_mode", None)
+        return batch is None or (forward_mode is not None and forward_mode.is_idle())
+    if batch is None:
+        return False
+    forward_mode = getattr(batch, "forward_mode", None)
+    return forward_mode is not None and forward_mode.is_decode()
+
+
+def _kt_staging_set_epoch_window_seen(scheduler, phase: str, stage: str) -> bool:
+    scheduler_epoch = _kt_staging_planner_epoch(scheduler)
+    window_key = f"{phase}:{stage}"
+    current_epoch = getattr(scheduler, "_kt_staging_planner_epoch", None)
+    phases = getattr(scheduler, "_kt_staging_planner_phases", None)
+    if current_epoch != scheduler_epoch or not isinstance(phases, set):
+        scheduler._kt_staging_planner_epoch = scheduler_epoch
+        scheduler._kt_staging_planner_phases = {window_key}
+        return True
+    if window_key in phases:
+        return False
+    phases.add(window_key)
+    scheduler._kt_staging_planner_phases = phases
+    return True
+
+
+def _kt_staging_forward_mode_label(
+    scheduler,
+    batch: Optional[ScheduleBatch],
+    phase: str,
+    index: int,
+    stage: str = "prepare",
+) -> str:
+    context = _kt_staging_runtime_window_context(
+        scheduler=scheduler,
+        batch=batch,
+        phase=phase,
+        stage=stage,
+        index=index,
+    )
+    return _kt_staging_runtime_window_label(context)
+
+
+def _kt_staging_cuda_capture_active() -> bool:
+    try:
+        return bool(
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
-    except Exception as err:
-        logger.warning(
-            "KT staging probe failed to start: %s", str(err).splitlines()[0]
-        )
-        return None
+    except Exception:
+        return True
+
+
+def _kt_staging_scheduler_ready(scheduler) -> bool:
+    return (
+        getattr(scheduler, "enable_overlap", False)
+        and getattr(scheduler, "pp_size", 1) > 1
+        and getattr(scheduler, "spec_algorithm", None) is not None
+        and scheduler.spec_algorithm.is_dflash()
+        and torch.cuda.is_available()
+    )
 
 
 def _finish_kt_staging_probe(probe: Optional[dict]) -> None:
@@ -464,6 +622,91 @@ def _finish_kt_staging_probe(probe: Optional[dict]) -> None:
         logger.warning(
             "KT staging probe failed to finish: %s", str(err).splitlines()[0]
         )
+
+
+def _finish_kt_staging_window(
+    scheduler, probes: Optional[List[dict]], phase: str
+) -> None:
+    probes_to_finish = list(getattr(scheduler, "_kt_staging_deferred_probes", []))
+    if probes_to_finish:
+        scheduler._kt_staging_deferred_probes = []
+    if probes:
+        probes_to_finish.extend(probes)
+    if not probes_to_finish:
+        return
+
+    if _kt_staging_cuda_capture_active():
+        scheduler._kt_staging_deferred_probes = probes_to_finish
+        logger.warning(
+            "KT staging window finish deferred during CUDA graph capture: "
+            "phase=%s probes=%d",
+            phase,
+            len(probes_to_finish),
+        )
+        return
+
+    # finish_kt_staging_probe can swap resident experts. Callers place this only
+    # after the current forward/result/idle boundary is no longer reading masks.
+    for probe in probes_to_finish:
+        _finish_kt_staging_probe(probe)
+
+
+def _start_kt_staging_window(
+    scheduler, batch: Optional[ScheduleBatch], phase: str, stage: str = "prepare"
+) -> List[dict]:
+    _finish_kt_staging_window(scheduler, [], f"{phase}:deferred")
+
+    budget = _kt_staging_window_budget(scheduler, batch, phase)
+    if (
+        budget <= 0
+        or not _kt_staging_scheduler_ready(scheduler)
+        or not _kt_staging_window_batch_supported(batch, phase)
+        or _kt_staging_cuda_capture_active()
+    ):
+        return []
+
+    if not _kt_staging_set_epoch_window_seen(scheduler, phase, stage):
+        return []
+
+    batch_size = batch.batch_size() if batch is not None else 0
+    probes: List[dict] = []
+    try:
+        from sglang.srt.layers.moe.kt_ep_wrapper import run_kt_staging_probe_once
+    except Exception as err:
+        logger.warning(
+            "KT staging probe failed to import: %s", str(err).splitlines()[0]
+        )
+        return probes
+
+    for index in range(budget):
+        try:
+            probe = run_kt_staging_probe_once(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                batch_size=batch_size,
+                forward_mode=_kt_staging_forward_mode_label(
+                    scheduler,
+                    batch,
+                    phase=phase,
+                    index=index,
+                    stage=stage,
+                ),
+            )
+        except Exception as err:
+            logger.warning(
+                "KT staging probe failed to start: %s", str(err).splitlines()[0]
+            )
+            break
+        if probe is not None:
+            probes.append(probe)
+
+    return probes
+
+
+def _run_kt_staging_window(
+    scheduler, batch: Optional[ScheduleBatch], phase: str, stage: str = "prepare"
+) -> None:
+    probes = _start_kt_staging_window(scheduler, batch, phase, stage=stage)
+    _finish_kt_staging_window(scheduler, probes, phase)
 
 
 def _log_dflash_run_batch_timing(
@@ -1441,12 +1684,13 @@ class Scheduler(
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
+        last_batch_forward_mode = getattr(self.last_batch, "forward_mode", None)
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
             and batch
             and batch.forward_mode.is_extend()
-            and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
+            and last_batch_forward_mode is not None
+            and last_batch_forward_mode.is_extend()
         )
 
         # We do not support overlap + spec + grammar yet,
@@ -2153,6 +2397,12 @@ class Scheduler(
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
+        last_batch_forward_mode = getattr(self.last_batch, "forward_mode", None)
+        last_batch_was_extend = bool(
+            self.last_batch
+            and last_batch_forward_mode is not None
+            and last_batch_forward_mode.is_extend()
+        )
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
@@ -2165,7 +2415,11 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
+        if (
+            self.last_batch
+            and last_batch_forward_mode is not None
+            and last_batch_forward_mode.is_extend()
+        ):
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -2224,6 +2478,12 @@ class Scheduler(
 
         # Handle DP attention and log stats
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
+        if (
+            ret is not None
+            and last_batch_was_extend
+            and ret.forward_mode.is_decode()
+        ):
+            _run_kt_staging_window(self, ret, phase="prefill_decode", stage="prepare")
 
         if ret:
             set_schedule_time_batch(ret)
@@ -2760,8 +3020,8 @@ class Scheduler(
                         kwargs = {}
                         if self.spec_algorithm.is_dflash() and self.pp_size > 1:
                             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-                        kt_staging_probe = _maybe_start_kt_staging_probe(
-                            self, batch
+                        kt_staging_probes = _start_kt_staging_window(
+                            self, batch, phase="forward", stage="prepare"
                         )
                         h2d_probe = _maybe_start_dflash_h2d_overlap_probe(
                             self, batch
@@ -2772,7 +3032,9 @@ class Scheduler(
                             **kwargs,
                         )
                         _finish_dflash_h2d_overlap_probe(self, h2d_probe)
-                        _finish_kt_staging_probe(kt_staging_probe)
+                        _finish_kt_staging_window(
+                            self, kt_staging_probes, phase="forward"
+                        )
                         _log_dflash_run_batch_timing(
                             self,
                             "scheduler.overlap.worker_forward",
@@ -2782,6 +3044,9 @@ class Scheduler(
                                 batch_result, "can_run_cuda_graph", None
                             ),
                         )
+                    kt_result_probes = _start_kt_staging_window(
+                        self, batch, phase="result", stage="commit"
+                    )
                     if (
                         batch.is_spec_v2
                         and self.spec_algorithm.is_dflash()
@@ -2828,6 +3093,9 @@ class Scheduler(
                         )
                     else:
                         batch_result.future_indices = future_indices
+                    _finish_kt_staging_window(
+                        self, kt_result_probes, phase="result"
+                    )
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
@@ -3354,7 +3622,12 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
+        last_batch_forward_mode = getattr(self.last_batch, "forward_mode", None)
+        if (
+            self.last_batch
+            and last_batch_forward_mode is not None
+            and last_batch_forward_mode.is_extend()
+        ):
             chunked_req_to_exclude = set()
             if recv_req.mode == "in_place":
                 if self.chunked_req is not None:
@@ -3463,8 +3736,14 @@ class Scheduler(
             del self.sessions[session_id]
 
     def maybe_sleep_on_idle(self):
-        if self.idle_sleeper is not None:
-            self.idle_sleeper.maybe_sleep()
+        kt_idle_probes = _start_kt_staging_window(
+            self, None, phase="idle", stage="prepare"
+        )
+        try:
+            if self.idle_sleeper is not None:
+                self.idle_sleeper.maybe_sleep()
+        finally:
+            _finish_kt_staging_window(self, kt_idle_probes, phase="idle")
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
