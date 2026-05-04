@@ -221,19 +221,50 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
-        # Full layer per-token memory (bytes)
-        self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
-        )
+        if hasattr(mr, "turboquant_bits"):
+            # TurboQuant: KV stored as packed uint8 (n*head_dim/2 bytes for
+            # 4-bit, /4 for 2-bit) plus a bf16 dequant scale per (token, head).
+            # No shared dequant buffer — fused decode reads packed directly.
+            # Default kv_size (bf16 = 2) over-counts by ~4x and shrinks the
+            # pool to ~32k where the actual budget allows ~128k+.
+            k_bits = getattr(mr, "turboquant_k_bits", mr.turboquant_bits)
+            v_bits = getattr(mr, "turboquant_v_bits", mr.turboquant_bits)
 
-        # SWA layer per-token memory (bytes)
-        self._swa_per_token = (
-            model_config.get_swa_num_kv_heads(tp_size)
-            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-            * kv_size
-        )
+            def _packed_bytes(bits, n, d):
+                if bits == 2:
+                    return n * (d // 4)
+                else:  # 4-bit
+                    return n * (d // 2)
+
+            n_full = model_config.get_num_kv_heads(tp_size)
+            d_full = model_config.head_dim
+            self._full_per_token = (
+                _packed_bytes(k_bits, n_full, d_full)
+                + _packed_bytes(v_bits, n_full, d_full)
+                + 2 * n_full * 2  # k + v dequant scale (bf16)
+            )
+
+            n_swa = model_config.get_swa_num_kv_heads(tp_size)
+            d_swa = model_config.swa_head_dim
+            self._swa_per_token = (
+                _packed_bytes(k_bits, n_swa, d_swa)
+                + _packed_bytes(v_bits, n_swa, d_swa)
+                + 2 * n_swa * 2
+            )
+        else:
+            # Full layer per-token memory (bytes)
+            self._full_per_token = (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+                * kv_size
+            )
+
+            # SWA layer per-token memory (bytes)
+            self._swa_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * kv_size
+            )
 
         # Bytes per token of max_total_num_tokens.
         #
