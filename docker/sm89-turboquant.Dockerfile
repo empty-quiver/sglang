@@ -178,6 +178,21 @@ COPY --from=builder /opt/venv /opt/venv
 # is already built and installed in /opt/venv from stage 1).
 COPY --from=builder /src/sglang/python /opt/sglang/python
 
+# Strip the setuptools-rust ext-modules table from pyproject.toml. The
+# table declares a Rust extension at ../rust/sglang-grpc/Cargo.toml that
+# requires Cargo 1.85+ (edition2024). We don't use sgl-grpc — the
+# OpenAI-compat HTTP server path doesn't load grpc._core. Removing the
+# table avoids needing rustup/cargo in the runtime stage entirely.
+RUN python3 -c '\
+import pathlib;\
+p = pathlib.Path("/opt/sglang/python/pyproject.toml");\
+s = p.read_text();\
+import re;\
+s2 = re.sub(r"\n\[\[tool\.setuptools-rust\.ext-modules\]\][^\[]*", "\n", s, flags=re.DOTALL);\
+assert s != s2, "no ext-modules table found";\
+p.write_text(s2);\
+print("stripped ext-modules table")'
+
 # Install sglang-kt from the local fork checkout WITHOUT deps so we don't
 # overwrite the sm_86+sm_89 sgl-kernel that we
 # built in the builder stage. Then install runtime deps explicitly.
@@ -200,7 +215,7 @@ RUN uv pip install --no-cache --no-deps -e ./python \
         psutil py-spy pybase64 pydantic python-multipart "pyzmq>=25.1.2" \
         requests scipy sentencepiece setproctitle soundfile==0.13.1 \
         tiktoken timm==1.0.16 torchcodec==0.8.0 tqdm \
-        transformers==4.57.1 uvicorn uvloop xgrammar==0.1.27 \
+        transformers==5.5.4 uvicorn uvloop xgrammar==0.1.27 \
         "smg-grpc-proto>=0.3.3" "grpcio>=1.78.0" \
         "grpcio-reflection>=1.78.0" "grpcio-health-checking>=1.78.0"
 

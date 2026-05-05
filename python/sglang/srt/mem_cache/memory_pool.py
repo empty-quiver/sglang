@@ -1255,17 +1255,28 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         turboquant_v_bits: int = 0,
         turboquant_uniform: bool = False,
         v_head_dim: Optional[int] = None,
+        swa_head_num: Optional[int] = None,
+        swa_head_dim: Optional[int] = None,
+        swa_v_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
         self.turboquant_bits = turboquant_bits
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
 
+        # Mirror MHATokenToKVPool's swa_* override: when SWAKVPool builds the
+        # SWA inner pool it forwards swa_head_num/swa_head_dim alongside the
+        # full-pool head_num/head_dim. The inner pool must use the SWA dims
+        # for its TurboQuantConfig + buffers, otherwise the WHT signs are
+        # sized for the full layer's head_dim and the kernel asserts
+        # "signs dim must match input dim" on the first SWA prefill.
+        effective_head_dim = swa_head_dim if swa_head_dim is not None else head_dim
+
         k_bits = turboquant_k_bits or turboquant_bits
         v_bits = turboquant_v_bits or turboquant_bits
         self.tq_config = TurboQuantConfig(
             bit_width=turboquant_bits,
-            head_dim=head_dim,
+            head_dim=effective_head_dim,
             device=device,
             k_bit_width=k_bits,
             v_bit_width=v_bits,
@@ -1281,6 +1292,9 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             v_head_dim=v_head_dim,
+            swa_head_num=swa_head_num,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_v_head_dim,
             start_layer=start_layer,
             end_layer=end_layer,
             enable_alt_stream=False,
@@ -1428,12 +1442,18 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             self.v_dequant_scale_buffer[i][tgt_loc] = self.v_dequant_scale_buffer[i][src_loc]
 
     def get_kv_size_bytes(self):
-        """Total GPU memory used by all TurboQuant buffers."""
-        total = 0
+        """Total GPU memory split (K + K_scale, V + V_scale).
+
+        Returns (k_size, v_size) bytes — matching MHATokenToKVPool's contract
+        so SWAKVPool's tuple-unpack path works. The dequant scale buffers are
+        attributed to their corresponding K / V side.
+        """
+        k_size = 0
+        v_size = 0
         for i in range(self.layer_num):
-            total += self.k_buffer[i].nbytes + self.v_buffer[i].nbytes
-            total += self.k_dequant_scale_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
-        return total
+            k_size += self.k_buffer[i].nbytes + self.k_dequant_scale_buffer[i].nbytes
+            v_size += self.v_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
+        return k_size, v_size
 
 
 class HybridLinearKVPool(KVCache):

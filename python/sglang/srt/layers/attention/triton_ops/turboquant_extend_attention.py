@@ -536,9 +536,15 @@ def tq_extend_attention_fwd(
 
     K_BLOCK_PACKED_DIM = triton.next_power_of_2(K_Lk_packed)
     V_BLOCK_PACKED_DIM = triton.next_power_of_2(V_Lv_packed)
-    # Smaller BLOCK_M than standard extend (128) due to N-way accumulator pressure
-    BLOCK_M = 64
-    BLOCK_N = 64
+    # sm_89 (RTX 4090) caps shared memory at 101 KiB. The kernel's
+    # SRAM footprint is dominated by k_block * BLOCK_N + v_block * BLOCK_N
+    # plus several BLOCK_M-sized accumulators in fp32. With BLOCK_M=N=64
+    # and K_BLOCK_PACKED_DIM=128 (Gemma 4 SWA, head_dim=256) we already
+    # need 128 KiB. Drop to BLOCK_M=N=32 unconditionally; that costs some
+    # throughput but works for both SWA and full-attention layers on
+    # sm_89. Reconsider once a tuned heuristic is available.
+    BLOCK_M = 16
+    BLOCK_N = 16
 
     sm_scale = sm_scale or 1.0 / (Lq ** 0.5)
     batch_size = qo_indptr.shape[0] - 1

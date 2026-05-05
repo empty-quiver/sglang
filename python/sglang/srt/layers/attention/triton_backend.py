@@ -931,8 +931,27 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
-        # TurboQuant: rotate Q into WHT domain; rotate K/V only if fresh (not from pool)
-        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        # TurboQuant: rotate Q into WHT domain; rotate K/V only if fresh (not from pool).
+        # SWA-aware: SWAKVPool has no tq_config of its own — its two inner
+        # pools (swa_kv_pool / full_kv_pool) each carry their own
+        # TurboQuantConfig sized for the layer's head_dim (Gemma 4 splits
+        # into 256-dim SWA layers and 512-dim full layers). Without this,
+        # tq_config = None for hybrid SWA models, the Q-rotation is
+        # skipped, the fused TQ extend path is skipped, and the request
+        # falls into get_key_buffer() which the TQ pool rejects.
+        _tq_router_pool = forward_batch.token_to_kv_pool
+        if hasattr(_tq_router_pool, "layers_mapping") and hasattr(
+            _tq_router_pool, "swa_kv_pool"
+        ):
+            _tq_inner_idx, _tq_is_swa = _tq_router_pool.layers_mapping[layer.layer_id]
+            _tq_inner_pool = (
+                _tq_router_pool.swa_kv_pool
+                if _tq_is_swa
+                else _tq_router_pool.full_kv_pool
+            )
+            tq_config = getattr(_tq_inner_pool, "tq_config", None)
+        else:
+            tq_config = getattr(_tq_router_pool, "tq_config", None)
         if tq_config is not None:
             if (
                 not _kv_from_pool
@@ -1001,24 +1020,40 @@ class TritonAttnBackend(AttentionBackend):
 
         # Get prefix KV buffers
         pool = forward_batch.token_to_kv_pool
+        # SWA-aware routing: when pool is a SWAKVPool, the per-layer KV
+        # buffers live on its inner pools (swa_kv_pool / full_kv_pool), and
+        # the index within that inner pool comes from layers_mapping. The
+        # window_kv_indptr / window_kv_indices set above are already
+        # sliding-window-filtered, so the fused TQ extend kernel iterates
+        # only over in-window tokens — sliding-window attention emerges
+        # implicitly without needing in-kernel masking.
+        if hasattr(pool, "layers_mapping") and hasattr(pool, "swa_kv_pool"):
+            inner_idx, is_swa = pool.layers_mapping[layer.layer_id]
+            tq_pool = pool.swa_kv_pool if is_swa else pool.full_kv_pool
+            tq_idx = inner_idx
+        else:
+            tq_pool = pool
+            tq_idx = layer.layer_id - pool.start_layer
+
         if (tq_config is not None
             and tq_config.k_bit_width in (2, 4)
             and tq_config.v_bit_width in (2, 4)
             and not self.enable_deterministic
-            and sliding_window_size == -1
             and kv_indptr is not None):
             # Fused TQ extend: read packed uint8 KV directly, skip dequant buffer
-            # Supports symmetric and asymmetric K/V bit widths
-            idx = layer.layer_id - pool.start_layer
+            # Supports symmetric and asymmetric K/V bit widths.
+            # Sliding-window-aware: when the caller routed window_kv_*
+            # metadata above, kv_indices already excludes out-of-window
+            # tokens; the kernel needs no further sliding_window_size hint.
             self.tq_extend_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
                 v.contiguous(),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                pool.k_buffer[idx],
-                pool.v_buffer[idx],
-                pool.k_dequant_scale_buffer[idx],
-                pool.v_dequant_scale_buffer[idx],
+                tq_pool.k_buffer[tq_idx],
+                tq_pool.v_buffer[tq_idx],
+                tq_pool.k_dequant_scale_buffer[tq_idx],
+                tq_pool.v_dequant_scale_buffer[tq_idx],
                 tq_config.k_centroids,
                 tq_config.v_centroids,
                 self.forward_metadata.qo_indptr,
@@ -1270,8 +1305,21 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
-        # TurboQuant: rotate Q into WHT domain
-        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        # TurboQuant: rotate Q into WHT domain.
+        # SWA-aware lookup — see forward_extend for the rationale.
+        _tq_router_pool = forward_batch.token_to_kv_pool
+        if hasattr(_tq_router_pool, "layers_mapping") and hasattr(
+            _tq_router_pool, "swa_kv_pool"
+        ):
+            _tq_inner_idx, _tq_is_swa = _tq_router_pool.layers_mapping[layer.layer_id]
+            _tq_inner_pool = (
+                _tq_router_pool.swa_kv_pool
+                if _tq_is_swa
+                else _tq_router_pool.full_kv_pool
+            )
+            tq_config = getattr(_tq_inner_pool, "tq_config", None)
+        else:
+            tq_config = getattr(_tq_router_pool, "tq_config", None)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -1281,13 +1329,20 @@ class TritonAttnBackend(AttentionBackend):
             # Fused TQ decode: read packed uint8 KV directly, skip dequant buffer
             # Supports symmetric (K=V) and asymmetric (K!=V) bit widths
             pool = forward_batch.token_to_kv_pool
-            idx = layer.layer_id - pool.start_layer
+            # Same SWAKVPool inner-pool routing as forward_extend.
+            if hasattr(pool, "layers_mapping") and hasattr(pool, "swa_kv_pool"):
+                inner_idx, is_swa = pool.layers_mapping[layer.layer_id]
+                tq_pool = pool.swa_kv_pool if is_swa else pool.full_kv_pool
+                idx = inner_idx
+            else:
+                tq_pool = pool
+                idx = layer.layer_id - pool.start_layer
             self.tq_decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                pool.k_buffer[idx],
-                pool.v_buffer[idx],
-                pool.k_dequant_scale_buffer[idx],
-                pool.v_dequant_scale_buffer[idx],
+                tq_pool.k_buffer[idx],
+                tq_pool.v_buffer[idx],
+                tq_pool.k_dequant_scale_buffer[idx],
+                tq_pool.v_dequant_scale_buffer[idx],
                 tq_config.k_centroids,
                 tq_config.v_centroids,
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
